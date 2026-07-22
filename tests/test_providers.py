@@ -2841,3 +2841,68 @@ class TestCLIPromptOnStdin:
             await provider.generate(GenerateRequest(prompt="secret prompt"))
 
         assert not Path(seen["path"]).exists()
+
+
+class TestCodexTurnFailed:
+    """Codex reports server-side rejections via turn.failed with exit code 0.
+
+    Without explicit handling these surface as a successful call with empty
+    output, so an unsupported model looks like the model simply said nothing.
+    """
+
+    TURN_FAILED = (
+        b'{"type":"turn.started"}\n'
+        b'{"type":"turn.failed","error":{"message":"model gpt-nope is not supported"}}\n'
+    )
+
+    def test_extract_error_message_reads_turn_failed(self):
+        from llm_council.providers.cli.codex import _extract_error_message
+
+        assert (
+            _extract_error_message(self.TURN_FAILED.decode()) == "model gpt-nope is not supported"
+        )
+
+    def test_extract_error_message_still_reads_plain_error(self):
+        from llm_council.providers.cli.codex import _extract_error_message
+
+        assert _extract_error_message('{"type":"error","message":"bad schema"}') == "bad schema"
+
+    def test_ingest_turn_failed_sets_error_message(self):
+        from llm_council.providers.cli.codex import _ingest_codex_stdout_line, _LiveCodexState
+
+        state = _LiveCodexState()
+        for line in self.TURN_FAILED.decode().splitlines():
+            _ingest_codex_stdout_line(line, state)
+
+        assert state.error_message == "model gpt-nope is not supported"
+        assert state.saw_turn_completed is True
+
+    @pytest.mark.asyncio
+    async def test_codex_raises_on_turn_failed_despite_exit_zero(self):
+        provider = CodexCLIProvider(cli_path="/usr/local/bin/codex")
+        process = AsyncMock()
+        process.communicate.return_value = (self.TURN_FAILED, b"")
+        process.returncode = 0
+
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=process),
+            pytest.raises(RuntimeError, match="gpt-nope is not supported"),
+        ):
+            await provider.generate(GenerateRequest(prompt="test"))
+
+    @pytest.mark.asyncio
+    async def test_codex_still_succeeds_without_turn_failed(self):
+        """Guard against the new check firing on healthy runs."""
+        provider = CodexCLIProvider(cli_path="/usr/local/bin/codex")
+        process = AsyncMock()
+        process.communicate.return_value = (
+            b'{"type":"item.completed","item":{"id":"i","type":"agent_message","text":"ok"}}\n'
+            b'{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}\n',
+            b"",
+        )
+        process.returncode = 0
+
+        with patch("asyncio.create_subprocess_exec", return_value=process):
+            response = await provider.generate(GenerateRequest(prompt="test"))
+
+        assert response.text == "ok"
