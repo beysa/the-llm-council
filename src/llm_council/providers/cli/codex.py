@@ -347,16 +347,8 @@ class CodexCLIProvider(ProviderAdapter):
         if output_last_message_path:
             cmd.extend(["-o", output_last_message_path])
 
-        prompt = ""
-        if request.messages:
-            parts = [m.content for m in request.messages if m.role == "user"]
-            prompt = "\n\n".join(parts)
-        elif request.prompt:
-            prompt = request.prompt
-        else:
-            raise ValueError("Either 'messages' or 'prompt' must be provided")
-
-        cmd.append(prompt)
+        # prompt is fed via stdin in generate(), NOT argv. Windows
+        # CreateProcess caps the command line at ~32KB; schema+prompt exceed it.
         return cmd
 
     def _check_unsafe_flags(self) -> None:
@@ -486,6 +478,7 @@ class CodexCLIProvider(ProviderAdapter):
         cli_home: str | None = None
         output_path: str | None = None
         schema_path: str | None = None
+        stdin_path: str | None = None
 
         try:
             cli_home = self._create_isolated_cli_home()
@@ -502,6 +495,18 @@ class CodexCLIProvider(ProviderAdapter):
                         _prepare_schema_for_codex(dict(request.structured_output.json_schema)),
                         schema_file,
                     )
+            prompt_text = ""
+            if request.messages:
+                prompt_text = "\n\n".join(m.content for m in request.messages if m.role == "user")
+            elif request.prompt:
+                prompt_text = request.prompt
+            if not prompt_text:
+                raise ValueError("Either 'messages' or 'prompt' must be provided")
+            stdin_fd, stdin_path = tempfile.mkstemp(
+                prefix="llm-council-codex-prompt-", suffix=".txt"
+            )
+            with os.fdopen(stdin_fd, "w", encoding="utf-8") as stdin_file:
+                stdin_file.write(prompt_text)
             cmd = self._build_command(
                 request,
                 model=model,
@@ -510,15 +515,19 @@ class CodexCLIProvider(ProviderAdapter):
             )
             env = self._get_subprocess_env()
             env["HOME"] = cli_home
-            # Safe: uses argument list, no shell; minimal environment
-            proc = await asyncio.create_subprocess_exec(
-                cmd[0],
-                *cmd[1:],
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-                start_new_session=True,
-            )
+            # Safe: uses argument list, no shell; minimal environment.
+            # The prompt is handed over as the child's stdin: the child gets its
+            # own dup of the descriptor, so the parent's handle closes here.
+            with open(stdin_path, "rb") as stdin_fh:
+                proc = await asyncio.create_subprocess_exec(
+                    cmd[0],
+                    *cmd[1:],
+                    stdin=stdin_fh,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=env,
+                    start_new_session=True,
+                )
 
             timeout = self._request_timeout(request)
             if (
@@ -683,7 +692,7 @@ class CodexCLIProvider(ProviderAdapter):
                 raw={"stdout": stdout_text},
             )
         finally:
-            for temp_path in (output_path, schema_path):
+            for temp_path in (output_path, schema_path, stdin_path):
                 if temp_path:
                     with contextlib.suppress(OSError):
                         os.unlink(temp_path)
