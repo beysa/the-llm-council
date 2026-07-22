@@ -70,6 +70,9 @@ credentials.json
 # Specs (internal planning docs)
 specs/
 
+# Internal working files (plans, lessons) — never in the public repo
+tasks/
+
 # Private local-only evaluation inputs and imported external repo material.
 # Use this for raw PR diffs, code snapshots, and benchmark fixtures sourced from
 # internal repos or external systems. Never commit its contents.
