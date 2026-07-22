@@ -200,7 +200,6 @@ class _LiveCodexState:
     saw_turn_started: bool = False
     saw_turn_completed: bool = False
     turn_started_at: float | None = None
-    last_stdout_at: float | None = None
 
 
 def _ingest_codex_stdout_line(line: str, state: _LiveCodexState) -> None:
@@ -269,7 +268,6 @@ async def _read_codex_stdout(stream: asyncio.StreamReader | None, state: _LiveCo
             return
         _ingest_codex_stdout_line(line.decode("utf-8", errors="replace"), state)
         now = asyncio.get_running_loop().time()
-        state.last_stdout_at = now
         if state.saw_turn_started and state.turn_started_at is None:
             state.turn_started_at = now
 

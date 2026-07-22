@@ -95,16 +95,13 @@ class HealthChecker:
     def __init__(
         self,
         timeout: float = DEFAULT_TIMEOUT,
-        fail_on_any_down: bool = False,
     ) -> None:
         """Initialize the health checker.
 
         Args:
             timeout: Timeout for individual health checks in seconds
-            fail_on_any_down: If True, treat any down provider as fatal
         """
         self._timeout = timeout
-        self._fail_on_any_down = fail_on_any_down
         self._cache: dict[str, ProviderHealth] = {}
         self._cache_ttl = 60.0  # Cache results for 60 seconds
 
@@ -240,21 +237,6 @@ class HealthChecker:
     def clear_cache(self) -> None:
         """Clear the health check cache."""
         self._cache.clear()
-
-    def should_skip_provider(self, health: ProviderHealth) -> bool:
-        """Determine if a provider should be skipped based on health.
-
-        Args:
-            health: Provider health status
-
-        Returns:
-            True if provider should be skipped
-        """
-        if health.status == HealthStatus.DOWN:
-            return True
-
-        # Skip on non-retryable errors
-        return health.error_type in (ErrorType.AUTH, ErrorType.BILLING, ErrorType.CLI_NOT_FOUND)
 
 
 async def preflight_check(

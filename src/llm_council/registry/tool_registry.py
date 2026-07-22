@@ -296,16 +296,6 @@ class ToolRegistry:
 
         logger.debug("No default tool registry config found; registry remains empty.")
 
-    def to_openai_tools(self, role: str | None = None) -> list[dict[str, Any]]:
-        """Convert tools to OpenAI format, optionally filtered by role."""
-        tools = self.get_tools_for_role(role) if role else self.get_all_tools()
-        return [t.to_openai_tool() for t in tools]
-
-    def to_anthropic_tools(self, role: str | None = None) -> list[dict[str, Any]]:
-        """Convert tools to Anthropic format, optionally filtered by role."""
-        tools = self.get_tools_for_role(role) if role else self.get_all_tools()
-        return [t.to_anthropic_tool() for t in tools]
-
 
 def get_tool_registry() -> ToolRegistry:
     """Get the singleton tool registry."""

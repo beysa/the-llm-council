@@ -99,22 +99,6 @@ class DegradationReport:
         elif event.action_taken == DegradationAction.ABORT:
             self.aborted = True
 
-    def to_summary(self) -> str:
-        """Generate human-readable summary."""
-        if not self.failures:
-            return "No degradation events"
-
-        lines = [f"Degradation: {len(self.failures)} failure(s)"]
-        if self.providers_skipped:
-            lines.append(f"  Skipped: {', '.join(self.providers_skipped)}")
-        if self.fallbacks_used:
-            lines.append(f"  Fallbacks: {', '.join(self.fallbacks_used)}")
-        if self.total_retries:
-            lines.append(f"  Retries: {self.total_retries}")
-        if self.aborted:
-            lines.append("  Status: ABORTED")
-        return "\n".join(lines)
-
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for serialization."""
         return {

@@ -29,10 +29,6 @@ from llm_council.providers.base import (
 # Default models for different use cases (March 2026)
 DEFAULT_MODEL = "anthropic/claude-opus-4-6"
 ENV_MODEL = "OPENROUTER_MODEL"
-FAST_MODEL = "anthropic/claude-haiku-4-5"
-REASONING_MODEL = "anthropic/claude-opus-4-6"
-CODE_MODEL = "openai/gpt-5.4"
-CRITIC_MODEL = "anthropic/claude-sonnet-4-6"
 OPENROUTER_CACHE_CONTROL_MODEL_PREFIXES = ("anthropic/",)
 logger = logging.getLogger(__name__)
 
@@ -194,7 +190,6 @@ class OpenRouterProvider(ProviderAdapter):
         self._base_url = base_url or os.environ.get("OPENROUTER_BASE_URL", self.BASE_URL)
         self._default_model = default_model or os.environ.get(ENV_MODEL) or DEFAULT_MODEL
         self._http_client = http_client
-        self._owns_client = http_client is None
 
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or create the HTTP client."""
@@ -203,12 +198,6 @@ class OpenRouterProvider(ProviderAdapter):
                 timeout=httpx.Timeout(120.0, connect=10.0),
             )
         return self._http_client
-
-    async def _close_client(self) -> None:
-        """Close the HTTP client if we own it."""
-        if self._http_client is not None and self._owns_client:
-            await self._http_client.aclose()
-            self._http_client = None
 
     def _get_headers(self) -> dict[str, str]:
         """Build request headers.

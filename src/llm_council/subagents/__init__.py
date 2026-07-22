@@ -83,13 +83,6 @@ class ModelOverrides(BaseModel):
         description="OpenRouter model ID (e.g., 'openai/gpt-5.4').",
     )
 
-    def get_for_provider(self, provider_name: str) -> str | None:
-        """Get model override for a specific provider."""
-        normalized = provider_name.replace("-", "_")
-        if provider_name == "google":
-            normalized = "gemini"
-        return getattr(self, normalized, None)
-
 
 class ReasoningBudget(BaseModel):
     """Reasoning/thinking budget configuration for a subagent."""

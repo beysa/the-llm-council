@@ -2536,12 +2536,6 @@ class Orchestrator:
         observations = self._execution_plan.setdefault("prompt_cache_observations", {})
         observations.setdefault(phase or "unknown", []).append(entry)
 
-    def _estimate_input_tokens(self, *parts: str) -> int:
-        """Return a lightweight token estimate for prompt diagnostics."""
-
-        estimate, _method, _padding = self._estimate_tokens_for_provider("default", *parts)
-        return estimate
-
     def _record_phase_prompt_metrics(
         self,
         phase: str,
@@ -3028,10 +3022,6 @@ class Orchestrator:
             f"{ctx}\n"
             "</reference_material>\n"
         )
-
-    def _extract_file_context_blocks(self) -> tuple[str, list[tuple[str, str]]]:
-        """Parse CLI-injected file context blocks from system_context."""
-        return self._reference_context_blocks()
 
     def _render_file_context(self, prefix: str, blocks: Sequence[tuple[str, str]]) -> str:
         """Render file context blocks back into the CLI-injected format."""

@@ -342,10 +342,6 @@ class Summarizer:
             )
         return results
 
-    def get_total_tokens_saved(self, results: dict[str, SummarizationResult]) -> int:
-        """Calculate total tokens saved from summarization results."""
-        return sum(r.tokens_saved for r in results.values())
-
 
 def summarize_for_context(
     content: str,

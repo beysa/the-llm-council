@@ -52,8 +52,11 @@ class TestEvalImport:
         ]
         diff_text = "diff --git a/a.go b/a.go\n@@ -1 +1 @@\n-old\n+new\n"
 
-        def fake_run(command, check, capture_output, text):
+        def fake_run(command, **kwargs):
             joined = " ".join(command)
+            assert kwargs["check"] is True
+            assert kwargs["capture_output"] is True
+            assert kwargs["text"] is True
             if "pr view" in joined:
                 return CompletedProcess(command, 0, stdout=json.dumps(pr_json), stderr="")
             if "pulls/owner/repo/pulls/42/comments" in joined:

@@ -58,11 +58,6 @@ class AgentResult:
     usage: dict[str, int] = field(default_factory=dict)  # token counts
     metadata: dict[str, Any] = field(default_factory=dict)
 
-    @property
-    def has_content(self) -> bool:
-        """Check if result has substantive content (not PASS)."""
-        return not self.passed and bool(self.content.strip())
-
 
 @dataclass
 class AgentContext:
@@ -136,13 +131,6 @@ class BaseAgent(ABC):
         """Get tools available to this agent."""
         return self._tools
 
-    def add_tools_from_registry(self, role: str | None = None) -> None:
-        """Load tools from registry for this agent's role."""
-        registry = get_tool_registry()
-        registry.ensure_loaded()
-        role_tools = registry.get_tools_for_role(role or self.ROLE_NAME)
-        self._tools.extend(role_tools)
-
     @abstractmethod
     async def run(self, context: AgentContext) -> AgentResult:
         """
@@ -155,11 +143,6 @@ class BaseAgent(ABC):
             AgentResult with content and metadata
         """
         pass
-
-    def _detect_pass(self, content: str) -> bool:
-        """Detect if agent response is a PASS."""
-        stripped = content.strip().upper()
-        return stripped == "PASS" or stripped.startswith("**PASS**")
 
 
 class DrafterAgent(BaseAgent):
@@ -261,39 +244,3 @@ Distinguish fact from inference.
             passed=False,
             metadata={"role": "researcher"},
         )
-
-
-# Agent factory for creating agents by role
-AGENT_CLASSES: dict[str, type[BaseAgent]] = {
-    "drafter": DrafterAgent,
-    "critic": CriticAgent,
-    "synthesizer": SynthesizerAgent,
-    "planner": PlannerAgent,
-    "researcher": ResearcherAgent,
-}
-
-
-def create_agent(
-    role: str,
-    model: str,
-    system_prompt: str = "",
-    tools: list[Tool] | None = None,
-) -> BaseAgent:
-    """
-    Factory function to create an agent by role.
-
-    Args:
-        role: Agent role (drafter, critic, etc.)
-        model: Model identifier
-        system_prompt: Additional system prompt
-        tools: Optional tool list
-
-    Returns:
-        Configured BaseAgent subclass
-    """
-    agent_class = AGENT_CLASSES.get(role, BaseAgent)
-    return agent_class(
-        model=model,
-        system_prompt=system_prompt,
-        tools=tools,
-    )
