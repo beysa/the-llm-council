@@ -66,6 +66,12 @@ routed handoff, capability planning, and deterministic eval tooling. Those
 capabilities materially extend the package runtime and make the public surface
 more explicit for planning, review, security, and research workflows.
 
+The `0.8.0` release fixes Windows large-prompt handling in the CLI provider
+adapters (stdin instead of argv), surfaces Codex `turn.failed` server
+rejections instead of empty successes, restores Claude Code CLI auth on
+subscription and Vertex machines, and isolates CLI subprocess working
+directories from the caller's repo.
+
 The `0.7.18` release adds provider-specific prompt-cache support. Cache request
 controls are adapter-owned, cache telemetry is normalized when providers return
 it, and Gemini/Vertex cached-content resources can be created, refreshed, and

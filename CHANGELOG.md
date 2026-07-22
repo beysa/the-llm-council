@@ -7,19 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-22
+
 ### Fixed
+- Windows: CLI provider adapters (Claude Code, Codex, Gemini) no longer hit
+  the ~32KB `CreateProcess` command-line cap on large prompts. Prompts travel
+  via stdin instead of argv — piped directly for Claude Code and Gemini, via a
+  scoped temp file for Codex (which streams stdout itself). (#54, thanks
+  @GalGreenfield)
+- Codex CLI adapter surfaces `turn.failed` events instead of returning empty
+  success: Codex exits 0 when the server rejects a request (e.g. an
+  unsupported model), and both the streaming and batch result paths previously
+  keyed failure off the exit code alone. (#42, thanks @beysa)
+- OpenRouter structured output strips JSON-Schema number-range keywords
+  (`minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`,
+  `multipleOf`, `$schema`) that some routed providers reject with a 400,
+  which could kill whole runs with "Below minimum required providers". (#55)
 - Claude Code CLI adapter authenticates again on subscription/keychain and
   Vertex machines: `--bare` (which restricts auth to `ANTHROPIC_API_KEY`) is
   now passed only when that key is set, with equivalent isolation flags
-  otherwise, and the subprocess env allowlist keeps `USER`/`LOGNAME`/
-  `USERNAME` plus OAuth-token and Vertex variables the CLI needs to resolve
-  credentials.
+  otherwise, and the subprocess env allowlist keeps `USER`/`LOGNAME` (and
+  Windows `USERNAME`/`USERPROFILE`/`APPDATA`/`LOCALAPPDATA`) plus OAuth-token
+  and Vertex variables the CLI needs to resolve credentials.
 - Gemini CLI adapter no longer fails headless runs with "not running in a
   trusted directory": the isolated `GEMINI_CLI_HOME` has no trust store, so
   the adapter passes `--skip-trust` (tool use remains gated by
   `--approval-mode`).
 - `llm_council.__init__` resolves `tomllib` via `sys.version_info` instead of
   `try/except`, fixing mypy inconsistencies across interpreter versions.
+
+### Security
+- CLI subprocesses no longer run from the caller's working directory. The
+  Gemini CLI runs from its empty isolated home (so `--skip-trust` can never
+  trust a directory carrying a malicious project `.gemini/` config whose MCP
+  servers would spawn at startup), and the Claude Code CLI runs from an empty
+  scratch directory (so `CLAUDE.md` auto-discovery cannot inject
+  attacker-controlled context on the non-`--bare` path).
 
 ### Removed
 - Dead code flagged by vulture across engine, providers, registry, storage,
@@ -30,6 +53,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (storage.artifacts), `Summarizer.get_total_tokens_saved`, and
   `ModelOverrides.get_for_provider`. Import them from your own code if you
   relied on them; they had no in-repo callers.
+
+### Changed
+- CI/publish pipeline moved to `actions/checkout@v7`,
+  `actions/upload-artifact@v7`, `actions/download-artifact@v8`, and
+  `codecov/codecov-action@v7`; dev lockfile picked up pygments 2.20.0,
+  idna 3.15, pytest 9.0.3, and pyasn1 0.6.4.
+- Repository housekeeping: agent tooling rules documented in `AGENTS.md`;
+  internal planning files are no longer tracked.
+
+### Thanks
+- @GalGreenfield for finding and fixing the Windows command-line-length
+  failure across all three CLI adapters (#54).
+- @beysa for root-causing the silent `turn.failed` empty-success bug in the
+  Codex adapter (#42).
+- @ahmedmelhady7 for the task-adaptive-protocol exploration (#36) — closed
+  for now, but the direction and the classifier test discipline informed the
+  roadmap discussion.
 
 ## [0.7.18] - 2026-06-10
 
