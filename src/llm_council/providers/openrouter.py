@@ -37,11 +37,33 @@ OPENROUTER_CACHE_CONTROL_MODEL_PREFIXES = ("anthropic/",)
 logger = logging.getLogger(__name__)
 
 
+# JSON-Schema validation keywords that some providers' structured-output
+# enforcement rejects. Anthropic (and the Azure/OpenAI fallback) return a 400
+# such as "output_config.format.schema: For 'number' type, properties maximum,
+# minimum are not supported". OpenRouter forwards the schema untouched, so a
+# single unsupported keyword makes every structured call to those providers
+# fail; when such a model is the only/critique model the whole run dies with
+# "Below minimum required providers (1)". We drop the keywords here — they only
+# constrain values, not the JSON shape, so removing them preserves semantics.
+_UNSUPPORTED_SCHEMA_KEYS = frozenset(
+    {
+        "$schema",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+    }
+)
+
+
 def _strip_schema_metadata(value: Any) -> Any:
     """Recursively remove metadata keys that OpenRouter/OpenAI ignore or reject."""
     if isinstance(value, dict):
         return {
-            key: _strip_schema_metadata(item) for key, item in value.items() if key != "$schema"
+            key: _strip_schema_metadata(item)
+            for key, item in value.items()
+            if key not in _UNSUPPORTED_SCHEMA_KEYS
         }
     if isinstance(value, list):
         return [_strip_schema_metadata(item) for item in value]
