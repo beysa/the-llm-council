@@ -350,7 +350,6 @@ class CodexCLIProvider(ProviderAdapter):
 
     def _build_command(
         self,
-        request: GenerateRequest,
         *,
         model: str,
         output_last_message_path: str | None = None,
@@ -530,7 +529,6 @@ class CodexCLIProvider(ProviderAdapter):
             with os.fdopen(stdin_fd, "w", encoding="utf-8") as stdin_file:
                 stdin_file.write(prompt_text)
             cmd = self._build_command(
-                request,
                 model=model,
                 output_last_message_path=output_path,
                 output_schema_path=schema_path,

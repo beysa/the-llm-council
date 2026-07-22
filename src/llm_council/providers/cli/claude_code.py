@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import shutil
+import tempfile
 from collections.abc import AsyncIterator
 from typing import Any, ClassVar
 
@@ -41,10 +42,29 @@ DEFAULT_MODEL = "sonnet"
 _ENV_ALLOWLIST = {
     "PATH",
     "HOME",
-    "ANTHROPIC_API_KEY",
     "TERM",
     "LANG",
     "LC_ALL",
+    # Identity: the CLI resolves its credential store (macOS keychain) via the
+    # current user; without USER, subscription OAuth fails with "Not logged in"
+    # even though the parent session is authenticated.
+    "USER",
+    "LOGNAME",
+    # Windows equivalents: identity plus the profile/appdata roots the CLI
+    # needs to locate its credential store.
+    "USERNAME",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    # Auth. The CLI supports several methods; strip none of them or the
+    # subprocess fails even though the parent works:
+    "ANTHROPIC_API_KEY",  # direct API key
+    "CLAUDE_CODE_OAUTH_TOKEN",  # subscription token provided via env
+    "CLAUDE_CODE_USE_VERTEX",  # route through Vertex AI ...
+    "ANTHROPIC_VERTEX_PROJECT_ID",  # ... with this GCP project
+    "CLOUD_ML_REGION",  # ... in this region
+    "GOOGLE_APPLICATION_CREDENTIALS",  # explicit ADC path, if set
+    "GOOGLE_CLOUD_PROJECT",  # ADC default project
 }
 
 
@@ -153,10 +173,35 @@ class ClaudeCodeCLIProvider(ProviderAdapter):
             "-p",  # non-interactive print mode
             "--output-format",
             "json",
-            "--bare",  # skip hooks/LSP/plugins — prevents recursion
             "--model",
             request.model or self._default_model,
         ]
+
+        # Isolation from the outer session (skip hooks/plugins — prevents
+        # recursion when council runs inside Claude Code). --bare does this
+        # best, but it restricts auth to ANTHROPIC_API_KEY only: OAuth and
+        # keychain are never read, so on subscription-auth machines it fails
+        # with "Not logged in". Without a key, fall back to flags that close
+        # the same recursion/execution surface (hooks, tools, MCP, settings).
+        # CLAUDE.md auto-discovery is a prompt-injection vector on this
+        # fallback path (--bare skips it); generate() mitigates it for both
+        # branches by running from an empty scratch CWD. Remaining gap vs
+        # --bare: auto-memory, attribution, and background prefetches —
+        # context-purity differences, not execution surface. Read the key via
+        # the same filtered env the subprocess receives so the branch decision
+        # and the child's auth can never disagree.
+        if self._get_minimal_env().get("ANTHROPIC_API_KEY"):
+            cmd.append("--bare")
+        else:
+            cmd.extend(
+                [
+                    "--setting-sources",
+                    "",  # no user/project/local settings → no hooks or plugins
+                    "--tools",
+                    "",  # generation only, no tool execution
+                    "--strict-mcp-config",  # no MCP servers from ambient config
+                ]
+            )
 
         # system prompt stays on argv (smaller); the user prompt is
         # fed via stdin in generate() to dodge Windows' ~32KB cmdline cap.
@@ -200,26 +245,36 @@ class ClaudeCodeCLIProvider(ProviderAdapter):
         prompt_bytes = self._prompt_text(request).encode("utf-8")
 
         timeout = self._request_timeout(request)
-        # Safe: uses argument list via create_subprocess_exec, no shell spawned
-        proc = await asyncio.create_subprocess_exec(
-            cmd[0],
-            *cmd[1:],
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=self._get_minimal_env(),
-            start_new_session=True,
-        )
+        # Run from an empty scratch directory: CLAUDE.md auto-discovery walks
+        # up from the CWD, so a caller directory could inject an
+        # attacker-controlled CLAUDE.md into the subprocess prompt. --bare
+        # skips discovery, but the non-bare fallback does not; an empty CWD
+        # protects both branches uniformly.
+        scratch_cwd = tempfile.mkdtemp(prefix="llm-council-claude-cwd-")
         try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(input=prompt_bytes), timeout=timeout
+            # Safe: uses argument list via create_subprocess_exec, no shell spawned
+            proc = await asyncio.create_subprocess_exec(
+                cmd[0],
+                *cmd[1:],
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=self._get_minimal_env(),
+                cwd=scratch_cwd,
+                start_new_session=True,
             )
-        except asyncio.TimeoutError:
-            await terminate_process_tree(proc)
-            raise RuntimeError(
-                f"Claude Code CLI timed out after {timeout}s. "
-                "Consider increasing timeout or simplifying the task."
-            )
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(input=prompt_bytes), timeout=timeout
+                )
+            except asyncio.TimeoutError:
+                await terminate_process_tree(proc)
+                raise RuntimeError(
+                    f"Claude Code CLI timed out after {timeout}s. "
+                    "Consider increasing timeout or simplifying the task."
+                )
+        finally:
+            shutil.rmtree(scratch_cwd, ignore_errors=True)
 
         stdout_text = stdout.decode("utf-8", errors="replace")
         stderr_text = stderr.decode("utf-8", errors="replace")

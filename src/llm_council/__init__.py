@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 
-try:
-    import tomllib  # type: ignore[import-not-found]
-except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # pragma: no cover - Python 3.10 fallback
     tomllib = None
 
 from .council import Council

@@ -325,6 +325,15 @@ class GeminiCLIProvider(ProviderAdapter):
         cmd.extend(["--approval-mode", self._approval_mode])
         cmd.extend(["-m", request.model or self._default_model])
         cmd.extend(["--output-format", "json"])
+        # Headless runs refuse untrusted directories outright ("Gemini CLI is
+        # not running in a trusted directory"). The isolated GEMINI_CLI_HOME
+        # has no trust store, so every CWD is untrusted; --skip-trust scopes
+        # trust to this session. Trusting an arbitrary CWD would let a
+        # malicious project .gemini/ config load (e.g. MCP servers spawning at
+        # startup), so generate() also runs the CLI from the empty isolated
+        # home directory — the trusted dir is one we created with nothing in
+        # it. Tool execution stays gated by --approval-mode.
+        cmd.append("--skip-trust")
         return cmd
 
     @staticmethod
@@ -361,6 +370,11 @@ class GeminiCLIProvider(ProviderAdapter):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
+                # --skip-trust trusts the CWD, so the CWD must be one we
+                # control: the freshly created, empty isolated home. A caller
+                # CWD could carry a malicious .gemini/ project config whose
+                # MCP servers would spawn at CLI startup.
+                cwd=cli_home,
                 start_new_session=True,
             )
 

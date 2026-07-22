@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -2906,3 +2907,113 @@ class TestCodexTurnFailed:
             response = await provider.generate(GenerateRequest(prompt="test"))
 
         assert response.text == "ok"
+
+
+class TestCLIAdapterAuthAndIsolation:
+    """Auth-related command construction and env passthrough for CLI adapters.
+
+    Regression guards for adapters that authenticated in the parent shell but
+    failed in the subprocess because the minimal env or --bare stripped the
+    credential path.
+    """
+
+    def test_claude_uses_bare_only_with_api_key(self, monkeypatch):
+        provider = ClaudeCodeCLIProvider(cli_path="/usr/local/bin/claude")
+        request = GenerateRequest(prompt="test")
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+        assert "--bare" in provider._build_command(request)
+
+        # --bare restricts auth to ANTHROPIC_API_KEY (OAuth/keychain never
+        # read); without a key the adapter must fall back to the equivalent
+        # isolation flags so subscription/Vertex auth still works.
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        cmd = provider._build_command(request)
+        assert "--bare" not in cmd
+        assert "--setting-sources" in cmd
+        assert "--strict-mcp-config" in cmd
+        tools_value = cmd[cmd.index("--tools") + 1]
+        assert tools_value == ""
+
+    def test_claude_env_allowlist_keeps_identity_and_auth_vars(self, monkeypatch):
+        provider = ClaudeCodeCLIProvider(cli_path="/usr/local/bin/claude")
+        monkeypatch.setenv("USER", "kozman")
+        monkeypatch.setenv("CLAUDE_CODE_USE_VERTEX", "1")
+        monkeypatch.setenv("ANTHROPIC_VERTEX_PROJECT_ID", "proj")
+        monkeypatch.setenv("SOME_RANDOM_SECRET", "leak-me-not")
+
+        env = provider._get_minimal_env()
+
+        # USER is how the CLI locates its keychain credential store; stripping
+        # it surfaced as "Not logged in" despite a logged-in parent session.
+        assert env["USER"] == "kozman"
+        assert env["CLAUDE_CODE_USE_VERTEX"] == "1"
+        assert env["ANTHROPIC_VERTEX_PROJECT_ID"] == "proj"
+        assert "SOME_RANDOM_SECRET" not in env
+
+    def test_gemini_command_skips_trust_prompt(self):
+        provider = GeminiCLIProvider(cli_path="/opt/homebrew/bin/gemini")
+        cmd = provider._build_command(GenerateRequest(prompt="test"))
+        # headless runs in the isolated GEMINI_CLI_HOME have no trust store,
+        # so every CWD is refused without --skip-trust
+        assert "--skip-trust" in cmd
+
+    @pytest.mark.asyncio
+    async def test_gemini_runs_from_isolated_home_not_caller_cwd(self):
+        """--skip-trust trusts the CWD, so the CWD must be the empty isolated
+        home — never the caller's directory, whose .gemini/ project config
+        (e.g. MCP servers spawning at startup) would be attacker-controlled."""
+        provider = GeminiCLIProvider(cli_path="/opt/homebrew/bin/gemini")
+        process = AsyncMock()
+        process.communicate.return_value = (b'{"response":"ok"}', b"")
+        process.returncode = 0
+
+        with patch("asyncio.create_subprocess_exec", return_value=process) as mock_exec:
+            await provider.generate(GenerateRequest(prompt="test"))
+
+        cwd = mock_exec.await_args.kwargs["cwd"]
+        env = mock_exec.await_args.kwargs["env"]
+        assert cwd == env["GEMINI_CLI_HOME"]
+        assert cwd != os.getcwd()
+
+    def test_claude_env_allowlist_excludes_common_secrets(self, monkeypatch):
+        """The allowlist must stay an allowlist: unrelated credentials in the
+        parent env may never reach the subprocess."""
+        provider = ClaudeCodeCLIProvider(cli_path="/usr/local/bin/claude")
+        secrets = {
+            "AWS_SECRET_ACCESS_KEY": "aws",
+            "AWS_ACCESS_KEY_ID": "aws",
+            "OPENAI_API_KEY": "oai",
+            "OPENROUTER_API_KEY": "or",
+            "GEMINI_API_KEY": "gem",
+            "GITHUB_TOKEN": "gh",
+            "DATABASE_URL": "db",
+            "SSH_AUTH_SOCK": "ssh",
+            "NPM_TOKEN": "npm",
+        }
+        for key, value in secrets.items():
+            monkeypatch.setenv(key, value)
+
+        env = provider._get_minimal_env()
+
+        leaked = sorted(k for k in secrets if k in env)
+        assert not leaked, f"secrets leaked into subprocess env: {leaked}"
+
+    @pytest.mark.asyncio
+    async def test_claude_runs_from_empty_scratch_cwd(self):
+        """CLAUDE.md auto-discovery walks up from the CWD, so the subprocess
+        must never run from the caller's directory (prompt-injection vector on
+        the non---bare fallback path)."""
+        provider = ClaudeCodeCLIProvider(cli_path="/usr/local/bin/claude")
+        process = AsyncMock()
+        process.communicate.return_value = (b'{"result":"ok"}', b"")
+        process.returncode = 0
+
+        with patch("asyncio.create_subprocess_exec", return_value=process) as mock_exec:
+            await provider.generate(GenerateRequest(prompt="test"))
+
+        cwd = mock_exec.await_args.kwargs["cwd"]
+        assert cwd != os.getcwd()
+        assert "llm-council-claude-cwd-" in cwd
+        # scratch dir is removed after the call
+        assert not Path(cwd).exists()

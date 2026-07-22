@@ -297,10 +297,8 @@ pip install -e ".[all]"
 ## Known Issues
 
 No open issues are currently tracked. Check `gh issue list` (or the GitHub repo)
-for the latest. Standing maintenance debt to be aware of:
-- **mypy not clean**: ~78 structural errors remain (typer `untyped-decorator`
-  pattern in `cli/main.py`, missing third-party stubs e.g. `types-PyYAML`).
-  Not regressions, but `mypy --strict` is not yet green.
+for the latest. `mypy src/` is clean (strict mode) as of v0.7.18 — CI enforces
+it on every push alongside ruff lint/format and the test suite.
 
 ### Resolved (historical, v0.6.x)
 - ~~Config wiring: `providers[].default_model` not passed to provider constructors~~ — Fixed in v0.6.0

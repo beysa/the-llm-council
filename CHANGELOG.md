@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Claude Code CLI adapter authenticates again on subscription/keychain and
+  Vertex machines: `--bare` (which restricts auth to `ANTHROPIC_API_KEY`) is
+  now passed only when that key is set, with equivalent isolation flags
+  otherwise, and the subprocess env allowlist keeps `USER`/`LOGNAME`/
+  `USERNAME` plus OAuth-token and Vertex variables the CLI needs to resolve
+  credentials.
+- Gemini CLI adapter no longer fails headless runs with "not running in a
+  trusted directory": the isolated `GEMINI_CLI_HOME` has no trust store, so
+  the adapter passes `--skip-trust` (tool use remains gated by
+  `--approval-mode`).
+- `llm_council.__init__` resolves `tomllib` via `sys.version_info` instead of
+  `try/except`, fixing mypy inconsistencies across interpreter versions.
+
+### Removed
+- Dead code flagged by vulture across engine, providers, registry, storage,
+  and subagents modules. This drops previously importable but unused public
+  symbols from the published package: `FAST_MODEL`, `REASONING_MODEL`,
+  `CODE_MODEL`, `CRITIC_MODEL` (providers.openrouter), `AGENT_CLASSES`,
+  `create_agent` (registry.base_agent), `cleanup_old_artifacts`
+  (storage.artifacts), `Summarizer.get_total_tokens_saved`, and
+  `ModelOverrides.get_for_provider`. Import them from your own code if you
+  relied on them; they had no in-repo callers.
+
 ## [0.7.18] - 2026-06-10
 
 ### Added
