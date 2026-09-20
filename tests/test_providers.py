@@ -322,6 +322,35 @@ class TestErrorClassification:
             ErrorType.TIMEOUT
         )
         assert classify_error("504 DEADLINE_EXCEEDED") == ErrorType.TIMEOUT
+
+    @pytest.mark.parametrize("seconds", [401, 429, 1401, 1429, 500, 502, 599, 600, 120])
+    def test_a_timeout_message_is_a_timeout_whatever_the_number_is(self, seconds):
+        """The number in the message must not be read as an HTTP status code.
+
+        Provider messages interpolate the limit - "timed out after 401.0s" - and the bare
+        patterns "401"/"429" used to match it as a substring. A timeout then classified as
+        AUTH, which is non-retryable: the seat was dropped with "check your API key".
+        """
+        message = (
+            f"Codex CLI timed out after {float(seconds)}s. "
+            "Consider increasing timeout or simplifying the task."
+        )
+
+        assert classify_error(message, 1) == ErrorType.TIMEOUT
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("HTTP 429 Too Many Requests", ErrorType.RATE_LIMIT),
+            ("status_code: 401 unauthorized", ErrorType.AUTH),
+            ("Error 500: internal server error", ErrorType.NETWORK),
+            ("got 502 bad gateway", ErrorType.NETWORK),
+            ("504 DEADLINE_EXCEEDED", ErrorType.TIMEOUT),
+        ],
+    )
+    def test_a_real_status_code_is_still_detected(self, text, expected):
+        """Guard: the narrower rule must not stop matching genuine status codes."""
+        assert classify_error(text, 1) == expected
         assert classify_error("Deadline expired before operation could complete.") == (
             ErrorType.TIMEOUT
         )
