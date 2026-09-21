@@ -39,7 +39,7 @@ from llm_council.evaluation import (
     run_eval_comparison,
     run_eval_dataset,
 )
-from llm_council.protocol.types import ReasoningProfile, RuntimeProfile
+from llm_council.protocol.types import FILE_STATUS_INCLUDED, ReasoningProfile, RuntimeProfile
 from llm_council.providers.concurrency import provider_call_slot
 from llm_council.storage.artifacts import ArtifactStore
 
@@ -516,7 +516,22 @@ def run(
         typer.Option(
             "--files",
             "-f",
-            help="File paths to include as context (repeatable, or comma-separated)",
+            help=(
+                "File paths to include as context (repeatable, or comma-separated). "
+                "Once a file is read into the prompt, it replaces the working tree's git "
+                "diff as evidence unless --git-diff is given (missing or over-the-limit "
+                "files do not); repository-analysis snippets are still added."
+            ),
+        ),
+    ] = None,
+    git_diff: Annotated[
+        bool | None,
+        typer.Option(
+            "--git-diff/--no-git-diff",
+            help=(
+                "Attach the working tree's git diff as review evidence. Default: yes, "
+                "unless --files attached a file."
+            ),
         ),
     ] = None,
     schema_file: Annotated[
@@ -607,7 +622,7 @@ def run(
             file_entries.append(
                 {
                     "path": fpath,
-                    "status": "included",
+                    "status": FILE_STATUS_INCLUDED,
                     "original_chars": original_chars,
                     "retained_chars": retained_chars,
                     "truncated": truncated,
@@ -754,6 +769,7 @@ def run(
             reasoning_profile=reasoning_profile,
             system_context=context,
             context_metadata=context_metadata,
+            git_diff_evidence=git_diff,
             output_schema=custom_schema,
             follow_router=route,
             provider_configs=_load_provider_configs(),
@@ -1811,7 +1827,7 @@ def config(
 providers:
   - name: openrouter
     api_key: ${OPENROUTER_API_KEY}
-    default_model: anthropic/claude-opus-4-6
+    default_model: anthropic/claude-opus-5
 
 # Default settings for 'council run' command
 defaults:

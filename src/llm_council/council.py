@@ -70,6 +70,7 @@ class Council:
             budget_class=config.budget_class,
             required_capabilities=list(config.required_capabilities),
             disable_local_evidence=config.disable_local_evidence,
+            git_diff_evidence=config.git_diff_evidence,
             temperature=config.temperature,
             max_tokens=config.max_tokens,
             runtime_profile=config.runtime_profile,

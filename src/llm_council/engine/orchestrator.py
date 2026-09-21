@@ -49,6 +49,7 @@ from llm_council.engine.degradation import (
 from llm_council.engine.evidence import EvidenceBundle, collect_capability_evidence
 from llm_council.engine.health import HealthReport, preflight_check
 from llm_council.protocol.types import (
+    FILE_STATUS_INCLUDED,
     PhaseTiming,
     ReasoningProfile,
     RuntimeProfile,
@@ -443,6 +444,13 @@ class OrchestratorConfig(BaseModel):
     disable_local_evidence: bool = Field(
         default=False,
         description="Disable local evidence collection and rely only on provided context.",
+    )
+    git_diff_evidence: bool | None = Field(
+        default=None,
+        description=(
+            "Attach the working tree's git diff as review evidence: True always, False never, "
+            "None (default) unless a --files attachment reached the prompt."
+        ),
     )
 
 
@@ -2171,16 +2179,46 @@ class Orchestrator:
                 items=[],
             )
 
-        bundle = await collect_capability_evidence(
-            self._task,
-            self._subagent_name,
-            self._resolved_mode,
-            self._capability_plan,
-        )
+        # --git-diff / --no-git-diff decide. By default a --files attachment replaces the
+        # working tree's git diff (documented on --files): the diff would add unrelated
+        # anchors and send unrelated local changes to every provider. Repository analysis
+        # still runs. Only files that reached the prompt count: if every entry was missing
+        # or skipped, the git diff is still the only local context.
+        include_diff = self._config.git_diff_evidence
+        if include_diff is None:
+            file_entries = self._config.context_metadata.get("files")
+            include_diff = not (
+                isinstance(file_entries, list)
+                and any(
+                    isinstance(entry, dict) and entry.get("status") == FILE_STATUS_INCLUDED
+                    for entry in file_entries
+                )
+            )
+        skip_capabilities: set[str] = set() if include_diff else {"diff-review"}
+
+        try:
+            bundle = await collect_capability_evidence(
+                self._task,
+                self._subagent_name,
+                self._resolved_mode,
+                self._capability_plan,
+                skip_capabilities=skip_capabilities,
+            )
+        except Exception as exc:
+            # Evidence is optional context; its collection must never abort the run.
+            logger.warning("Local evidence collection failed: %s", exc, exc_info=True)
+            required = list(self._capability_plan.required_capabilities)
+            bundle = EvidenceBundle(
+                executed_capabilities=[],
+                pending_capabilities=[c for c in required if c not in skip_capabilities],
+                skipped_capabilities=[c for c in required if c in skip_capabilities],
+                items=[],
+            )
 
         if self._execution_plan is not None:
             self._execution_plan["executed_capabilities"] = list(bundle.executed_capabilities)
             self._execution_plan["pending_capabilities"] = list(bundle.pending_capabilities)
+            self._execution_plan["skipped_capabilities"] = list(bundle.skipped_capabilities)
             self._execution_plan["evidence_items"] = len(bundle.items)
 
         return bundle

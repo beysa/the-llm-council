@@ -5,8 +5,11 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import os
 import re
+import stat
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -17,21 +20,101 @@ from llm_council.engine.capabilities import CapabilityPlan
 
 logger = logging.getLogger(__name__)
 
-TEXT_EXTENSIONS = {
+# Source code. Listed before other text, so the few lines that reach the prompt favour code.
+CODE_EXTENSIONS = {
     ".py",
+    ".tsx",
+    ".ts",
+    ".js",
+    ".jsx",
+    ".sh",
+    # Compiled/native ecosystems: hand-written source and headers
+    ".rs",
+    ".go",
+    ".java",
+    ".kt",
+    ".kts",
+    ".cs",
+    ".cpp",
+    ".cc",
+    ".cxx",
+    ".c",
+    ".h",
+    ".hpp",
+    ".hh",
+    ".hxx",
+    ".inl",
+    ".m",
+    ".mm",
+    ".rb",
+    ".php",
+    ".swift",
+}
+TEXT_EXTENSIONS = CODE_EXTENSIONS | {
     ".md",
     ".yaml",
     ".yml",
     ".json",
     ".toml",
     ".txt",
-    ".tsx",
-    ".ts",
-    ".js",
-    ".jsx",
-    ".sh",
+    # Hand-edited build descriptors (small text)
+    ".gradle",
+    ".cmake",
 }
+# Walked only outside git: inside a work tree the file list comes from `git ls-files`.
 SEARCH_DIRS = ("src", "tests", "config", "docs")
+# Generated files that share a source extension and sit beside hand-written source, so
+# .gitignore rarely covers them: protobuf, Go/k8s codegen, C# designer output, UE UHT
+# output, minified or bundled JS. Matched case-insensitively against the file name.
+GENERATED_FILE_SUFFIXES = (
+    ".generated.h",
+    ".gen.cpp",
+    ".gen.go",
+    ".pb.go",
+    ".pb.cc",
+    ".pb.h",
+    "_pb2.py",
+    ".designer.cs",
+    ".g.cs",
+    ".g.i.cs",
+    ".min.js",
+    ".bundle.js",
+)
+# The collectors read candidate files in order until they have enough hits, so these
+# bound the scan's disk reads as well as the prompt: at most this many files, none
+# larger than this (lockfiles, data dumps and bundles rather than hand-written source).
+MAX_CANDIDATE_FILES = 2000
+MAX_CANDIDATE_BYTES = 512_000
+# Data rather than prose or config: ranked after both, so tracked JSON collections cannot
+# crowd documentation out of the capped list.
+DATA_EXTENSIONS = {".json"}
+GIT_LIST_TIMEOUT_SECONDS = 5.0
+# A PARSE ceiling, not a capture bound: git's whole listing is held in memory until it
+# exits or GIT_LIST_TIMEOUT_SECONDS passes, and only this much of it (about 200,000 paths)
+# is parsed. The rest is dropped at an entry boundary and the scan is reported truncated.
+MAX_LISTING_BYTES = 16_000_000
+# Candidates examined (lstat + resolve) before the scan stops, whatever was kept: a tree of
+# mostly oversized or linked files must not turn the loop into a long walk.
+MAX_EXAMINED_FILES = 4 * MAX_CANDIDATE_FILES
+# A repository's own fsmonitor hook is a program git would run for us: never.
+_GIT_SAFE_CONFIG = ("-c", "core.fsmonitor=false")
+# Variables that point git at a repository other than the working directory's (a git hook,
+# or a caller running inside one, may have them set). Evidence is about repo_root itself.
+# Every GIT_CONFIG* variable is dropped as well: through them a caller's configuration
+# reaches git, e.g. core.excludesFile hiding files from the scan or color.diff=always
+# putting escape codes into the diff that is parsed. (core.worktree injected that way
+# does not move a discovered repository's work tree; checked 2026-09-21.)
+_GIT_REPOSITORY_ENV = frozenset(
+    {
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+    }
+)
 STOPWORDS = {
     "this",
     "that",
@@ -134,12 +217,15 @@ class EvidenceBundle(BaseModel):
 
     executed_capabilities: list[str] = Field(default_factory=list)
     pending_capabilities: list[str] = Field(default_factory=list)
+    # Left out on purpose (e.g. the git diff when --files set the scope), not unavailable:
+    # reported apart so a reviewer does not read a scoping choice as missing evidence.
+    skipped_capabilities: list[str] = Field(default_factory=list)
     items: list[EvidenceItem] = Field(default_factory=list)
 
     def to_prompt_block(self) -> str:
         """Render collected evidence as a bounded prompt block."""
 
-        if not self.items and not self.pending_capabilities:
+        if not self.items and not self.pending_capabilities and not self.skipped_capabilities:
             return ""
 
         lines = ["## Collected Evidence"]
@@ -149,6 +235,11 @@ class EvidenceBundle(BaseModel):
             lines.append(
                 "Capability packs not executed in this runtime: "
                 + ", ".join(self.pending_capabilities)
+            )
+        if self.skipped_capabilities:
+            lines.append(
+                "Capability packs left out by the run's scope (not a failure): "
+                + ", ".join(self.skipped_capabilities)
             )
         for item in self.items:
             lines.append(f"- [{item.capability}] {item.title}: {item.summary}")
@@ -188,15 +279,16 @@ def _collect_capability_evidence_sync(
     skip_capabilities: set[str],
 ) -> EvidenceBundle:
     bundle = EvidenceBundle()
+    files: list[Path]
     try:
-        files = _candidate_files(repo_root)
+        files = _candidate_files(repo_root, _extract_keywords(task))
     except OSError as exc:
         logger.warning("Candidate file scan failed: %s", exc, exc_info=True)
         files = []
 
     for capability in capability_plan.required_capabilities:
         if capability in skip_capabilities:
-            bundle.pending_capabilities.append(capability)
+            bundle.skipped_capabilities.append(capability)
             continue
 
         collector = _CAPABILITY_COLLECTORS.get(capability)
@@ -221,21 +313,154 @@ def _collect_capability_evidence_sync(
     return bundle
 
 
-def _candidate_files(repo_root: Path) -> list[Path]:
-    """Return bounded candidate files for evidence scanning."""
+class _Candidates(list[Path]):
+    """Candidate files, plus whether the scan stopped before it had seen them all."""
 
-    files: list[Path] = []
+    truncated = False
+
+
+def _candidate_files(repo_root: Path, keywords: Sequence[str] = ()) -> _Candidates:
+    """Return bounded candidate files for evidence scanning, most relevant first.
+
+    Inside a git work tree the list comes from git - tracked files plus untracked ones it
+    does not ignore - so build output, dependencies and editor state never reach the scan,
+    whatever the repository's layout. Outside git, or when git fails, SEARCH_DIRS are walked
+    instead. Submodules and nested repositories are not entered: their files are not in
+    this repository's index, and a gitlink is not a regular file.
+
+    Order: paths naming more of the task's keywords, then code, then prose and config,
+    then data. The file-count cap applies after that ranking, so a relevant file is never
+    cut for an alphabetically earlier one; the listing ceiling (MAX_LISTING_BYTES) cuts
+    git's path-ordered output before ranking, and says so via `truncated`.
+
+    Every file kept is a regular file whose fully resolved path lies inside repo_root:
+    whatever git prints, nothing outside the repository is read. The check precedes the
+    later read, so a concurrent swap of a path component in between is out of scope (a
+    local tool reading its own working tree). Files the user attaches with --files are not
+    part of this scan: they are sent as named.
+    """
+
+    root = repo_root.resolve()
+    listed = _git_listed_files(repo_root)
+    paths, truncated = listed if listed is not None else (_walked_files(repo_root), False)
+    wanted = [
+        path
+        for path in paths
+        if path.suffix.lower() in TEXT_EXTENSIONS and not _is_generated(path.name)
+    ]
+
+    def rank(path: Path) -> tuple[int, int, str]:
+        relative = _relative_text(path, repo_root)
+        suffix = path.suffix.lower()
+        kind = 0 if suffix in CODE_EXTENSIONS else 2 if suffix in DATA_EXTENSIONS else 1
+        return (-sum(keyword in relative for keyword in keywords), kind, relative)
+
+    wanted.sort(key=rank)
+    files = _Candidates()
+    for examined, path in enumerate(wanted):
+        if len(files) >= MAX_CANDIDATE_FILES or examined >= MAX_EXAMINED_FILES:
+            truncated = True
+            break
+        try:
+            info = path.lstat()
+        except OSError:
+            continue
+        # A link may point anywhere, a parent directory may be one, and git can be
+        # made to print "../" or absolute names: keep regular files that resolve inside.
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_size > MAX_CANDIDATE_BYTES
+            or not _inside(path, root)
+        ):
+            continue
+        files.append(path)
+    files.truncated = truncated
+    return files
+
+
+def _git_listed_files(repo_root: Path) -> tuple[list[Path], bool] | None:
+    """Files git lists under repo_root and whether the list was cut short, or None when
+    repo_root is not a git work tree (or git fails)."""
+
+    try:
+        completed = subprocess.run(
+            [
+                "git",
+                *_GIT_SAFE_CONFIG,
+                "ls-files",
+                "-z",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "--",
+                ".",
+            ],
+            cwd=repo_root,
+            env=_git_env(),
+            check=False,
+            capture_output=True,
+            timeout=GIT_LIST_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    listing = completed.stdout or b""
+    truncated = len(listing) > MAX_LISTING_BYTES
+    if truncated:
+        # Whole entries only: cut after the last separator inside the ceiling.
+        listing = listing[: listing.rfind(b"\0", 0, MAX_LISTING_BYTES) + 1]
+    names = listing.decode("utf-8", errors="replace").split("\0")
+    return [repo_root / name for name in dict.fromkeys(names) if name], truncated
+
+
+def _git_env() -> dict[str, str]:
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key not in _GIT_REPOSITORY_ENV and not key.upper().startswith("GIT_CONFIG")
+    }
+
+
+def _inside(path: Path, root: Path) -> bool:
+    """Whether `path`, with every link and `..` resolved, lies inside `root` (resolved)."""
+
+    try:
+        return path.resolve().is_relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _relative_text(path: Path, repo_root: Path) -> str:
+    """The path inside the repository, lowercased with forward slashes."""
+
+    try:
+        return path.relative_to(repo_root).as_posix().lower()
+    except ValueError:
+        return path.name.lower()
+
+
+def _display_path(path: Path, repo_root: Path) -> str:
+    try:
+        return str(path.relative_to(repo_root))
+    except ValueError:
+        return str(path)
+
+
+def _walked_files(repo_root: Path) -> list[Path]:
+    """Every path under SEARCH_DIRS: the fallback outside git."""
+
+    paths: list[Path] = []
     for dirname in SEARCH_DIRS:
         base = repo_root / dirname
-        if not base.exists():
-            continue
-        for path in sorted(base.rglob("*")):
-            if not path.is_file():
-                continue
-            if path.suffix.lower() not in TEXT_EXTENSIONS:
-                continue
-            files.append(path)
-    return files
+        if base.is_dir():
+            paths.extend(base.rglob("*"))
+    return paths
+
+
+def _is_generated(name: str) -> bool:
+    lowered = name.lower()
+    return lowered.startswith("zz_generated") or lowered.endswith(GENERATED_FILE_SUFFIXES)
 
 
 def _collect_repo_analysis(
@@ -243,13 +468,15 @@ def _collect_repo_analysis(
 ) -> EvidenceItem:
     """Collect a bounded repository footprint plus task-keyword hits."""
 
-    sample_files = [str(path.relative_to(repo_root)) for path in files[:8]]
+    # `files` arrive ranked by _candidate_files: paths naming the task first.
+    sample_files = [_display_path(path, repo_root) for path in files[:8]]
     keywords = _extract_keywords(task)
     hits = _search_files(files, keywords, repo_root, limit=10) if keywords else []
 
+    truncated = ", truncated" if getattr(files, "truncated", False) else ""
     summary = (
-        f"Scanned {len(files)} text files under {', '.join(SEARCH_DIRS)}. "
-        f"Task-keyword hits found: {len(hits)}."
+        f"Scanned {len(files)} text files in the repository (task-named paths and code "
+        f"first{truncated}). Task-keyword hits found: {len(hits)}."
     )
     details = []
     if sample_files:
@@ -470,11 +697,7 @@ def _search_files(
             snippet = line.strip()
             if len(snippet) > 120:
                 snippet = snippet[:117] + "..."
-            try:
-                display_path = str(path.relative_to(repo_root))
-            except ValueError:
-                display_path = str(path)
-            hits.append(f"{display_path}:{line_number}: {snippet}")
+            hits.append(f"{_display_path(path, repo_root)}:{line_number}: {snippet}")
             if len(hits) >= limit:
                 return hits
 
@@ -524,9 +747,11 @@ def _fetch_docs_page(url: str) -> tuple[str, str] | None:
 def _load_git_diff(repo_root: Path) -> str:
     """Load a bounded unified diff for the current repository state."""
 
+    # No program the repository configures may run: fsmonitor hook, external diff, textconv.
+    base = ["git", *_GIT_SAFE_CONFIG, "diff", "--no-ext-diff", "--no-textconv", "--unified=3"]
     commands = [
-        ["git", "diff", "--no-ext-diff", "--unified=3", "--", "."],
-        ["git", "diff", "--no-ext-diff", "--cached", "--unified=3", "--", "."],
+        [*base, "--", "."],
+        [*base, "--cached", "--", "."],
     ]
     diff_parts: list[str] = []
 
@@ -535,6 +760,7 @@ def _load_git_diff(repo_root: Path) -> str:
             completed = subprocess.run(
                 command,
                 cwd=repo_root,
+                env=_git_env(),
                 check=False,
                 capture_output=True,
                 text=True,

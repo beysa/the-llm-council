@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 
 from llm_council.config.models import (
     DEFAULT_COUNCIL_MODELS,
@@ -14,7 +15,11 @@ from llm_council.config.models import (
     is_multi_model_enabled,
     parse_models_string,
 )
-from llm_council.providers.openrouter import OpenRouterProvider, create_openrouter_for_model
+from llm_council.providers.openrouter import (
+    DEFAULT_MODEL,
+    OpenRouterProvider,
+    create_openrouter_for_model,
+)
 
 
 class TestModelConfig:
@@ -72,14 +77,14 @@ class TestModelConfig:
         assert len(models) == 1
 
     def test_model_pack_defaults(self) -> None:
-        """Model packs have correct defaults (March 2026)."""
-        assert get_model_for_pack(ModelPack.FAST) == "anthropic/claude-haiku-4-5"
-        assert get_model_for_pack(ModelPack.REASONING) == "anthropic/claude-opus-4-6"
+        """Model packs have correct defaults (September 2026)."""
+        assert get_model_for_pack(ModelPack.FAST) == "anthropic/claude-haiku-4.5"
+        assert get_model_for_pack(ModelPack.REASONING) == "anthropic/claude-opus-5"
         assert get_model_for_pack(ModelPack.CODE) == "openai/gpt-5.4"
-        assert get_model_for_pack(ModelPack.CODE_COMPLEX) == "anthropic/claude-opus-4-6"
-        assert get_model_for_pack(ModelPack.CRITIC) == "anthropic/claude-sonnet-4-6"
+        assert get_model_for_pack(ModelPack.CODE_COMPLEX) == "anthropic/claude-opus-5"
+        assert get_model_for_pack(ModelPack.CRITIC) == "anthropic/claude-sonnet-5"
         assert get_model_for_pack(ModelPack.GROUNDED) == "google/gemini-3.1-pro-preview"
-        assert get_model_for_pack(ModelPack.DEFAULT) == "anthropic/claude-opus-4-6"
+        assert get_model_for_pack(ModelPack.DEFAULT) == "anthropic/claude-opus-5"
 
     def test_model_pack_overrides(self) -> None:
         """Model pack env vars override defaults."""
@@ -89,8 +94,8 @@ class TestModelConfig:
 
         assert get_model_for_pack(ModelPack.FAST) == "custom/fast-model"
         assert get_model_for_pack(ModelPack.CODE) == "custom/code-model"
-        # Non-overridden packs still use defaults (March 2026)
-        assert get_model_for_pack(ModelPack.REASONING) == "anthropic/claude-opus-4-6"
+        # Non-overridden packs still use defaults (September 2026)
+        assert get_model_for_pack(ModelPack.REASONING) == "anthropic/claude-opus-5"
 
     def test_parse_models_string(self) -> None:
         """parse_models_string correctly parses comma-separated models."""
@@ -247,11 +252,21 @@ class TestDefaultCouncilModels:
     """Tests for default council model configuration."""
 
     def test_default_models_defined(self) -> None:
-        """DEFAULT_COUNCIL_MODELS contains expected models (March 2026)."""
+        """DEFAULT_COUNCIL_MODELS contains expected models (September 2026)."""
         assert len(DEFAULT_COUNCIL_MODELS) == 3
-        assert "anthropic/claude-opus-4-6" in DEFAULT_COUNCIL_MODELS
+        assert "anthropic/claude-opus-5" in DEFAULT_COUNCIL_MODELS
         assert "openai/gpt-5.4" in DEFAULT_COUNCIL_MODELS
         assert "google/gemini-3.1-pro-preview" in DEFAULT_COUNCIL_MODELS
+
+    def test_openrouter_defaults_use_the_dotted_version_form(self) -> None:
+        """A FORMAT guard only: "anthropic/claude-opus-4-6" is the Anthropic API's own id and
+        is not in OpenRouter's catalogue. Whether an id is listed cannot be tested offline;
+        the current defaults were checked against the catalogue on 2026-09-21."""
+        slugs = [*DEFAULT_MODEL_PACKS.values(), *DEFAULT_COUNCIL_MODELS, DEFAULT_MODEL]
+
+        dashed = [slug for slug in slugs if re.search(r"-\d+-\d+$", slug)]
+
+        assert not dashed, f"not OpenRouter slugs (dashed version): {dashed}"
 
     def test_all_model_packs_defined(self) -> None:
         """All ModelPack variants have default models."""
@@ -332,7 +347,7 @@ class TestSubagentModelPack:
         router_config = load_subagent("router")
         model = get_model_for_subagent(router_config)
 
-        # Should be the FAST pack model (claude-haiku-4-5)
+        # Should be the FAST pack model (claude-haiku-4.5)
         assert "haiku" in model.lower()
 
     def test_get_model_for_subagent_honors_pack_env_override(self) -> None:

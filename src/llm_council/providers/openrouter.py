@@ -26,8 +26,9 @@ from llm_council.providers.base import (
     ProviderCapabilities,
 )
 
-# Default models for different use cases (March 2026)
-DEFAULT_MODEL = "anthropic/claude-opus-4-6"
+# Default model, checked against OpenRouter's catalogue on 2026-09-21 (see DEFAULT_MODEL_PACKS
+# in config/models.py): "anthropic/claude-opus-4-6" was never an OpenRouter id.
+DEFAULT_MODEL = "anthropic/claude-opus-5"
 ENV_MODEL = "OPENROUTER_MODEL"
 OPENROUTER_CACHE_CONTROL_MODEL_PREFIXES = ("anthropic/",)
 logger = logging.getLogger(__name__)

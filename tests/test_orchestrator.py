@@ -21,7 +21,7 @@ from llm_council.engine.orchestrator import (
     OrchestratorConfig,
     ValidationResult,
 )
-from llm_council.protocol.types import ReasoningProfile, RuntimeProfile
+from llm_council.protocol.types import FILE_STATUS_INCLUDED, ReasoningProfile, RuntimeProfile
 from llm_council.providers.base import (
     DoctorResult,
     ErrorType,
@@ -2798,3 +2798,128 @@ class TestProviderFailover:
             provider="claude", error="CLI failed (unknown)", phase="draft", remaining_providers=0
         )
         assert second.action == DegradationAction.ABORT
+
+
+class TestEvidenceCollectionWiring:
+    """Run-level evidence collection: what --files suppresses, and that it never aborts."""
+
+    @staticmethod
+    def _prepared_orchestrator(config: OrchestratorConfig) -> Orchestrator:
+        orchestrator = Orchestrator(providers=[], config=config)
+        orchestrator._task = "Review the change"
+        orchestrator._subagent_name = "critic"
+        orchestrator._resolved_mode = "review"
+        orchestrator._capability_plan = CapabilityPlan(
+            execution_profile="light_tools",
+            budget_class="normal",
+            required_capabilities=["diff-review", "repo-analysis"],
+        )
+        return orchestrator
+
+    async def _skipped_capabilities(
+        self, monkeypatch: pytest.MonkeyPatch, config: OrchestratorConfig
+    ) -> object:
+        captured: dict[str, object] = {}
+
+        async def fake_collect(
+            task, subagent, mode, plan, *, repo_root=None, skip_capabilities=None
+        ):
+            captured["skip_capabilities"] = skip_capabilities
+            return EvidenceBundle()
+
+        monkeypatch.setattr(
+            "llm_council.engine.orchestrator.collect_capability_evidence", fake_collect
+        )
+        await self._prepared_orchestrator(config)._collect_evidence_for_run()
+        return captured["skip_capabilities"]
+
+    @pytest.mark.asyncio
+    async def test_user_files_skip_diff_review(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """--files reference context suppresses the automatic git-diff evidence."""
+
+        config = OrchestratorConfig(
+            context_metadata={"files": [{"path": "src/app.py", "status": FILE_STATUS_INCLUDED}]}
+        )
+
+        assert await self._skipped_capabilities(monkeypatch, config) == {"diff-review"}
+
+    @pytest.mark.asyncio
+    async def test_user_files_that_never_reached_the_prompt_keep_diff_review(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Missing or over-the-limit --files entries leave the git diff as the only context."""
+
+        config = OrchestratorConfig(
+            context_metadata={
+                "files": [
+                    {"path": "gone.py", "status": "missing"},
+                    {"path": "big.py", "status": "skipped_total_limit"},
+                ]
+            }
+        )
+
+        assert await self._skipped_capabilities(monkeypatch, config) == set()
+
+    @pytest.mark.asyncio
+    async def test_no_user_files_keeps_diff_review(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Without --files context, the git-diff evidence collector stays enabled."""
+
+        assert await self._skipped_capabilities(monkeypatch, OrchestratorConfig()) == set()
+
+    @pytest.mark.asyncio
+    async def test_git_diff_flag_keeps_the_diff_beside_attached_files(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """--git-diff: a spec attached with --files must not hide the implementation diff."""
+
+        config = OrchestratorConfig(
+            git_diff_evidence=True,
+            context_metadata={"files": [{"path": "SPEC.md", "status": FILE_STATUS_INCLUDED}]},
+        )
+
+        assert await self._skipped_capabilities(monkeypatch, config) == set()
+
+    @pytest.mark.asyncio
+    async def test_no_git_diff_flag_drops_the_diff_without_files(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = OrchestratorConfig(git_diff_evidence=False)
+
+        assert await self._skipped_capabilities(monkeypatch, config) == {"diff-review"}
+
+    @pytest.mark.asyncio
+    async def test_evidence_failure_never_aborts_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An evidence-collection crash degrades to a pending-only bundle."""
+
+        async def broken_collect(*args, **kwargs):
+            raise AttributeError("'NoneType' object has no attribute 'strip'")
+
+        monkeypatch.setattr(
+            "llm_council.engine.orchestrator.collect_capability_evidence", broken_collect
+        )
+
+        orchestrator = self._prepared_orchestrator(OrchestratorConfig())
+        bundle = await orchestrator._collect_evidence_for_run()
+
+        assert bundle.items == []
+        assert bundle.executed_capabilities == []
+        assert bundle.pending_capabilities == ["diff-review", "repo-analysis"]
+
+    @pytest.mark.asyncio
+    async def test_evidence_failure_keeps_a_deliberate_skip_out_of_pending(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Pending reads as 'could not run'; a diff left out by --no-git-diff is not that."""
+
+        async def broken_collect(*args, **kwargs):
+            raise AttributeError("'NoneType' object has no attribute 'strip'")
+
+        monkeypatch.setattr(
+            "llm_council.engine.orchestrator.collect_capability_evidence", broken_collect
+        )
+
+        orchestrator = self._prepared_orchestrator(OrchestratorConfig(git_diff_evidence=False))
+        bundle = await orchestrator._collect_evidence_for_run()
+
+        assert bundle.pending_capabilities == ["repo-analysis"]
+        assert bundle.skipped_capabilities == ["diff-review"]

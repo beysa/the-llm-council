@@ -12,6 +12,10 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+# `status` of a --files entry in context_metadata["files"] whose content reached the prompt.
+# The CLI writes it and the orchestrator reads it; one name keeps the two from drifting.
+FILE_STATUS_INCLUDED = "included"
+
 
 class SummaryTier(str, Enum):
     """Summarization detail levels."""
@@ -151,6 +155,14 @@ class CouncilConfig(BaseModel):
     disable_local_evidence: bool = Field(
         default=False,
         description="Disable local evidence collection and rely only on provided reference material.",
+    )
+    git_diff_evidence: bool | None = Field(
+        default=None,
+        description=(
+            "Attach the working tree's git diff as review evidence: True always, False never, "
+            "None (default) unless a --files attachment reached the prompt, in which case the "
+            "attached files are the review's scope."
+        ),
     )
     follow_router: bool = Field(
         default=False,

@@ -338,7 +338,7 @@ def get_model_for_subagent(
         model_pack: Optional runtime model-pack override.
 
     Returns:
-        OpenRouter-format model ID (e.g., 'anthropic/claude-opus-4-6').
+        OpenRouter-format model ID (e.g., 'anthropic/claude-opus-5').
     """
     pack = (
         normalize_model_pack(model_pack) if model_pack is not None else get_model_pack(config, mode)

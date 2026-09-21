@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
+import pytest
 from conftest import isolate_home
 from typer.testing import CliRunner
 
@@ -593,7 +595,7 @@ class TestCLIConfig:
         assert config_file.exists()
         contents = config_file.read_text()
         assert "api_key: ${OPENROUTER_API_KEY}" in contents
-        assert "default_model: anthropic/claude-opus-4-6" in contents
+        assert "default_model: anthropic/claude-opus-5" in contents
 
     def test_load_provider_configs_expands_env_api_keys(self, tmp_path, monkeypatch):
         """Provider configs should expand ${ENV_VAR} placeholders before constructor wiring."""
@@ -912,6 +914,47 @@ class TestMarkdownOutputFormat:
             result = runner.invoke(app, ["run", "router", "Test task"])
             assert result.exit_code == 0
             assert "# Council Result: SUCCESS" in result.stdout
+
+
+class TestCLIGitDiffEvidence:
+    """--git-diff / --no-git-diff reach the council config; the default is left to the run."""
+
+    @staticmethod
+    def _config_for(*flags: str) -> object:
+        mock_result = MagicMock()
+        mock_result.success = True
+        mock_result.output = {"result": "test"}
+        mock_result.model_dump.return_value = {"success": True, "output": {"result": "test"}}
+        mock_result.validation_errors = None
+        with (
+            patch("llm_council.Council") as mock_council_class,
+            patch("asyncio.run") as mock_run,
+            patch("llm_council.cli.main._load_config_defaults", return_value={}),
+        ):
+            mock_council_class.return_value = MagicMock()
+            mock_run.return_value = mock_result
+            result = runner.invoke(app, ["run", "critic", "Review", *flags, "--json"])
+        assert result.exit_code in [0, 1]
+        return mock_council_class.call_args.kwargs["config"]
+
+    @pytest.mark.parametrize(
+        ("flags", "expected"),
+        [((), None), (("--git-diff",), True), (("--no-git-diff",), False)],
+    )
+    def test_the_flag_reaches_the_council_config(
+        self, flags: tuple[str, ...], expected: bool | None
+    ) -> None:
+        assert self._config_for(*flags).git_diff_evidence is expected
+
+    def test_the_files_help_says_attachments_replace_the_diff(self) -> None:
+        result = runner.invoke(app, ["run", "--help"], env={"COLUMNS": "200"})
+        # Rich wraps help inside box-drawing borders; compare the words only.
+        text = " ".join(re.sub("[\\u2500-\\u257f]", " ", result.output).split())
+
+        assert "--git-diff" in text
+        assert "Once a file is read into the prompt, it replaces the working tree's git" in text
+        assert "diff as evidence unless --git-diff is given (missing or over-the-limit" in text
+        assert "repository-analysis snippets are still added" in text
 
 
 class TestCLIContextMetadata:
