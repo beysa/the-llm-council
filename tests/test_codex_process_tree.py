@@ -19,6 +19,7 @@ import threading
 import time
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -760,6 +761,357 @@ class TestTheIsolatedHomeIsWhatCodexReads:
             monkeypatch.setenv(codex_module._REASONING_EFFORT_ENV, raw)
 
         assert CodexCLIProvider(cli_path="codex")._reasoning_effort() == expected
+
+
+def _refuse(*_args: object, **_kwargs: object) -> None:
+    raise OSError(18, "Invalid cross-device link")  # e.g. a home on another volume
+
+
+class TestTheSignInIsSharedNotCopied:
+    """Codex rotates the ChatGPT refresh token on every refresh; a stale copy signs you out.
+
+    Codex saves a refreshed token into CODEX_HOME/auth.json in place. Were that file a copy,
+    the new token would die with the isolated home while the real file kept a refresh token
+    that is already spent - and the user's next refresh would fail with "your refresh token
+    was already used". The real auth.json must never be left older than what Codex wrote,
+    and the adapter itself must never write it.
+    """
+
+    ORIGINAL = '{"tokens": "original"}'
+
+    def _real_sign_in(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        home = tmp_path / "home"
+        (home / ".codex").mkdir(parents=True)
+        real = home / ".codex" / "auth.json"
+        real.write_text(self.ORIGINAL, encoding="utf-8")
+        monkeypatch.setattr("llm_council.providers.cli.codex.Path.home", lambda: home)
+        return real
+
+    @staticmethod
+    def _codex_saves(auth_file: Path, content: str) -> None:
+        """What codex-rs FileAuthStorage::save does: truncate and rewrite in place."""
+        with auth_file.open("w", encoding="utf-8") as fh:
+            fh.write(content)
+
+    @staticmethod
+    def _replace(target: Path, content: str) -> None:
+        """What a program saving by temp file + rename does to `target`."""
+        tmp = target.with_name(target.name + ".tmp")
+        tmp.write_text(content, encoding="utf-8")
+        os.replace(tmp, target)
+
+    @staticmethod
+    async def _run_call(
+        provider: CodexCLIProvider, during_the_call: Callable[[Path], None]
+    ) -> None:
+        """generate() with a fake Codex that does `during_the_call(its CODEX_HOME)`."""
+        process = AsyncMock()
+        process.communicate.return_value = (b"", b"")
+        process.returncode = 0
+
+        def _fake_exec(*_args: object, **kwargs: object) -> AsyncMock:
+            env = kwargs.get("env")
+            codex_home = env.get("CODEX_HOME") if isinstance(env, dict) else None
+            if codex_home:
+                during_the_call(Path(codex_home))
+            return process
+
+        with patch("asyncio.create_subprocess_exec", side_effect=_fake_exec):
+            await provider.generate(GenerateRequest(prompt="test"))
+
+    @staticmethod
+    def _kept(real: Path) -> list[Path]:
+        return sorted(real.parent.glob("auth.json.council-*"))
+
+    @staticmethod
+    def _record_homes(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+        """Every isolated home the adapter creates, wherever it ends up creating it."""
+        homes: list[Path] = []
+        mkdtemp = tempfile.mkdtemp
+
+        def _recording_mkdtemp(*args: Any, **kwargs: Any) -> str:
+            path = mkdtemp(*args, **kwargs)
+            if Path(path).name.startswith("llm-council-codex-home-"):
+                homes.append(Path(path))
+            return path
+
+        monkeypatch.setattr(codex_module.tempfile, "mkdtemp", _recording_mkdtemp)
+        return homes
+
+    def test_a_refresh_codex_writes_reaches_the_real_file_at_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        real = self._real_sign_in(tmp_path, monkeypatch)
+        cli_home = Path(CodexCLIProvider(cli_path="codex")._create_isolated_cli_home())
+
+        self._codex_saves(cli_home / ".codex" / "auth.json", '{"tokens": "refreshed"}')
+
+        assert real.read_text(encoding="utf-8") == '{"tokens": "refreshed"}'
+
+    def test_codex_signing_out_in_the_isolated_home_leaves_the_real_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Codex signs out with remove_file: that must drop only the isolated entry."""
+        real = self._real_sign_in(tmp_path, monkeypatch)
+        cli_home = Path(CodexCLIProvider(cli_path="codex")._create_isolated_cli_home())
+
+        (cli_home / ".codex" / "auth.json").unlink()
+
+        assert real.read_text(encoding="utf-8") == self.ORIGINAL
+
+    @pytest.mark.asyncio
+    async def test_the_real_sign_in_is_never_left_older_than_what_codex_wrote(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        real = self._real_sign_in(tmp_path, monkeypatch)
+
+        with caplog.at_level("WARNING", logger="llm_council.providers.cli.codex"):
+            await self._run_call(
+                CodexCLIProvider(cli_path="codex"),
+                lambda home: self._codex_saves(home / "auth.json", '{"tokens": "refreshed"}'),
+            )
+
+        assert real.read_text(encoding="utf-8") == '{"tokens": "refreshed"}'
+        assert not [r for r in caplog.records if "sign" in r.getMessage()], "no false alarm"
+        assert not self._kept(real)
+
+    @pytest.mark.asyncio
+    async def test_a_sign_in_that_cannot_be_shared_is_refused_not_copied(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        real = self._real_sign_in(tmp_path, monkeypatch)
+        monkeypatch.setattr(codex_module.os, "link", _refuse)
+        homes = self._record_homes(monkeypatch)
+
+        with pytest.raises(RuntimeError, match="cannot share your sign-in"):
+            await self._run_call(CodexCLIProvider(cli_path="codex"), lambda _home: None)
+
+        assert real.read_text(encoding="utf-8") == self.ORIGINAL
+        assert homes, "the call made a home"
+        assert not [home for home in homes if home.exists()], "and removed it"
+
+    def test_a_filesystem_that_cannot_tell_files_apart_is_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without trustworthy file identity, sharing cannot be confirmed or checked."""
+        real = self._real_sign_in(tmp_path, monkeypatch)
+        monkeypatch.setattr(codex_module, "_file_identity", lambda _path: None)
+        homes = self._record_homes(monkeypatch)
+
+        with pytest.raises(RuntimeError, match="cannot confirm"):
+            CodexCLIProvider(cli_path="codex")._create_isolated_cli_home()
+
+        assert real.read_text(encoding="utf-8") == self.ORIGINAL
+        assert homes, "the call made a home"
+        assert not [home for home in homes if home.exists()], "and removed it"
+
+    @pytest.mark.asyncio
+    async def test_a_sign_in_cut_short_is_reported_and_left_alone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A Codex ended mid-save cuts the shared file short. The adapter must not write it -
+        Codex and the desktop app write it unlocked - only tell the user to sign in again."""
+        real = self._real_sign_in(tmp_path, monkeypatch)
+
+        with caplog.at_level("WARNING", logger="llm_council.providers.cli.codex"):
+            await self._run_call(
+                CodexCLIProvider(cli_path="codex"),
+                lambda home: self._codex_saves(home / "auth.json", '{"tok'),
+            )
+
+        assert real.read_text(encoding="utf-8") == '{"tok', "the adapter never writes it"
+        assert [r for r in caplog.records if "codex login" in r.getMessage()]
+
+    @pytest.mark.asyncio
+    async def test_a_sign_out_elsewhere_is_never_undone_even_if_codex_saves_after_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The desktop app signs out, THEN the call's Codex saves: the sign-out still wins."""
+        real = self._real_sign_in(tmp_path, monkeypatch)
+
+        def _sign_out_then_save(home: Path) -> None:
+            real.unlink()
+            self._codex_saves(home / "auth.json", '{"tokens": "refreshed-after-sign-out"}')
+
+        with caplog.at_level("WARNING", logger="llm_council.providers.cli.codex"):
+            await self._run_call(CodexCLIProvider(cli_path="codex"), _sign_out_then_save)
+
+        assert not real.exists()
+        assert not self._kept(real)
+        assert not [r for r in caplog.records if "sign" in r.getMessage()]
+
+    @pytest.mark.asyncio
+    async def test_a_real_file_replaced_elsewhere_keeps_the_calls_save_aside(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Another program replaces auth.json by rename, then the call's Codex saves into the
+        file the two names used to share: that save exists nowhere else and must survive."""
+        real = self._real_sign_in(tmp_path, monkeypatch)
+
+        def _replaced_then_saved(home: Path) -> None:
+            self._replace(real, '{"tokens": "from-elsewhere"}')
+            self._codex_saves(home / "auth.json", '{"tokens": "saved-in-the-call"}')
+
+        with caplog.at_level("WARNING", logger="llm_council.providers.cli.codex"):
+            await self._run_call(CodexCLIProvider(cli_path="codex"), _replaced_then_saved)
+
+        assert real.read_text(encoding="utf-8") == '{"tokens": "from-elsewhere"}'
+        kept = self._kept(real)
+        assert [k.read_text(encoding="utf-8") for k in kept] == ['{"tokens": "saved-in-the-call"}']
+        assert [r for r in caplog.records if "codex login" in r.getMessage()]
+
+    @pytest.mark.asyncio
+    async def test_a_real_name_left_as_a_dangling_link_is_no_sign_out(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A sign-out removes the NAME. A name still there that no longer resolves is not one,
+        so the call's save must be kept, not dropped with the call's home."""
+        real = self._real_sign_in(tmp_path, monkeypatch)
+        try:
+            (tmp_path / "probe").symlink_to(tmp_path / "missing")
+        except (OSError, NotImplementedError):
+            pytest.skip("this system does not let the tests create symlinks")
+
+        def _saved_then_left_dangling(home: Path) -> None:
+            self._codex_saves(home / "auth.json", '{"tokens": "saved-in-the-call"}')
+            real.unlink()
+            real.symlink_to(tmp_path / "missing.json")
+
+        with caplog.at_level("WARNING", logger="llm_council.providers.cli.codex"):
+            await self._run_call(CodexCLIProvider(cli_path="codex"), _saved_then_left_dangling)
+
+        assert real.is_symlink() and not real.exists(), "left as it was"
+        kept = self._kept(real)
+        assert [k.read_text(encoding="utf-8") for k in kept] == ['{"tokens": "saved-in-the-call"}']
+        assert [r for r in caplog.records if "codex login" in r.getMessage()]
+
+    @pytest.mark.asyncio
+    async def test_a_real_name_that_no_longer_resolves_is_no_sign_out_on_any_system(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The dangling link where symlinks are unavailable: the name is still there (lstat),
+        the file it names is not (stat)."""
+        real = self._real_sign_in(tmp_path, monkeypatch)
+        stat = Path.stat
+
+        def _unresolved(path: Path, *args: Any, **kwargs: Any) -> os.stat_result:
+            if path == real and kwargs.get("follow_symlinks", True):
+                raise FileNotFoundError(2, "No such file or directory", str(path))
+            return stat(path, *args, **kwargs)
+
+        def _saved_then_unresolved(home: Path) -> None:
+            self._codex_saves(home / "auth.json", '{"tokens": "saved-in-the-call"}')
+            monkeypatch.setattr(Path, "stat", _unresolved)
+
+        with caplog.at_level("WARNING", logger="llm_council.providers.cli.codex"):
+            await self._run_call(CodexCLIProvider(cli_path="codex"), _saved_then_unresolved)
+
+        kept = self._kept(real)
+        assert [k.read_text(encoding="utf-8") for k in kept] == ['{"tokens": "saved-in-the-call"}']
+        assert [r for r in caplog.records if "codex login" in r.getMessage()]
+
+    @pytest.mark.asyncio
+    async def test_a_name_that_cannot_be_looked_up_is_reported_not_taken_for_a_sign_out(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        real = self._real_sign_in(tmp_path, monkeypatch)
+
+        def _denied(lookup: Callable[..., os.stat_result]) -> Callable[..., os.stat_result]:
+            def _lookup(path: Path, *args: Any, **kwargs: Any) -> os.stat_result:
+                if path == real:
+                    raise PermissionError(13, "Permission denied", str(path))
+                return lookup(path, *args, **kwargs)
+
+            return _lookup
+
+        def _lookups_denied(_home: Path) -> None:
+            monkeypatch.setattr(Path, "stat", _denied(Path.stat))
+            monkeypatch.setattr(Path, "lstat", _denied(Path.lstat))
+
+        with caplog.at_level("WARNING", logger="llm_council.providers.cli.codex"):
+            await self._run_call(CodexCLIProvider(cli_path="codex"), _lookups_denied)
+
+        assert [r for r in caplog.records if "codex login" in r.getMessage()]
+
+    @pytest.mark.asyncio
+    async def test_a_save_that_cannot_be_kept_gets_its_own_warning(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A full disk or a read-only ~/.codex loses the call's save: say so, and what to do."""
+        real = self._real_sign_in(tmp_path, monkeypatch)
+
+        def _disk_full(_real: Path, _data: bytes) -> Path:
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(codex_module, "_keep_aside", _disk_full)
+
+        def _replaced_then_saved(home: Path) -> None:
+            self._replace(real, '{"tokens": "from-elsewhere"}')
+            self._codex_saves(home / "auth.json", '{"tokens": "saved-in-the-call"}')
+
+        with caplog.at_level("WARNING", logger="llm_council.providers.cli.codex"):
+            await self._run_call(CodexCLIProvider(cli_path="codex"), _replaced_then_saved)
+
+        assert real.read_text(encoding="utf-8") == '{"tokens": "from-elsewhere"}'
+        messages = [r.getMessage() for r in caplog.records]
+        assert [m for m in messages if "could not be kept" in m and "codex login" in m]
+
+    @pytest.mark.asyncio
+    async def test_a_replaced_isolated_entry_is_kept_aside_never_written_over_the_real_one(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Should a Codex version save by temp file + rename, the link breaks on ITS side."""
+        real = self._real_sign_in(tmp_path, monkeypatch)
+
+        await self._run_call(
+            CodexCLIProvider(cli_path="codex"),
+            lambda home: self._replace(home / "auth.json", '{"tokens": "refreshed-by-rename"}'),
+        )
+
+        assert real.read_text(encoding="utf-8") == self.ORIGINAL
+        kept = self._kept(real)
+        assert [k.read_text(encoding="utf-8") for k in kept] == [
+            '{"tokens": "refreshed-by-rename"}'
+        ]
+
+    def test_kept_aside_copies_never_collide_or_open_up(self, tmp_path: Path) -> None:
+        real = tmp_path / "auth.json"
+        real.write_text("{}", encoding="utf-8")
+
+        first = codex_module._keep_aside(real, b'{"n": 1}')
+        second = codex_module._keep_aside(real, b'{"n": 2}')
+
+        assert first != second
+        assert first.read_bytes() == b'{"n": 1}'
+        assert second.read_bytes() == b'{"n": 2}'
+        if sys.platform != "win32":
+            assert first.stat().st_mode & 0o077 == 0, "owner-only"
+
+    @pytest.mark.asyncio
+    async def test_cleanup_with_the_sign_in_held_open_leaves_the_real_file_intact(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Windows: another application may hold auth.json open while the home is removed."""
+        real = self._real_sign_in(tmp_path, monkeypatch)
+
+        with real.open("rb"):
+            await self._run_call(CodexCLIProvider(cli_path="codex"), lambda _home: None)
+
+        assert real.read_text(encoding="utf-8") == self.ORIGINAL
+
+    def test_other_credentials_are_copied_not_shared(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only auth.json's storage is known; .credentials.json stays a plain copy."""
+        real = self._real_sign_in(tmp_path, monkeypatch)
+        credentials = real.parent / ".credentials.json"
+        credentials.write_text('{"mcp": "x"}', encoding="utf-8")
+
+        cli_home = Path(CodexCLIProvider(cli_path="codex")._create_isolated_cli_home())
+
+        copied = cli_home / ".codex" / ".credentials.json"
+        assert copied.read_text(encoding="utf-8") == '{"mcp": "x"}'
+        assert not os.path.samefile(credentials, copied)
 
 
 class TestTheIsolatedHomeIsRemoved:

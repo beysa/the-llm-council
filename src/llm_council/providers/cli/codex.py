@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -542,6 +543,159 @@ def _close_job(job: int | None) -> None:
         logger.warning("Codex CLI: closing the job handle failed (%s)", ctypes.get_last_error())
 
 
+# The ChatGPT sign-in Codex keeps in CODEX_HOME. Its refresh token ROTATES: every refresh issues a
+# new one and the old one is dead from then on. A council call must therefore SHARE the user's
+# file and never copy it - a refresh into a throwaway copy dies with the copy and leaves the real
+# file holding a spent token, which signs the user out at their next refresh ("your refresh token
+# was already used"). Codex saves by truncating and rewriting the file in place and signs out with
+# remove_file (codex-rs FileAuthStorage), so a HARD LINK shares every refresh, while a sign-out in
+# the call's home drops only that entry. Not a symlink: a save through a symlink whose target was
+# signed out elsewhere would create the real file again and undo that sign-out. This module never
+# writes the real file itself: Codex and the desktop app write it without a lock
+# (openai/codex#10332), so any write of ours could race theirs and put back a spent token.
+_SIGN_IN_FILE = "auth.json"
+# Copied as before and never shared: nothing shows how Codex writes or rotates it, and a council
+# call runs without the MCP servers it belongs to.
+_COPIED_FILES = (".credentials.json",)
+
+
+@dataclass
+class _SharedSignIn:
+    real: Path
+    isolated: Path
+    identity: tuple[int, int]  # (st_dev, st_ino) of the file both names shared
+    digest: str  # sha256 of its content when it was shared
+
+
+def _file_identity(path: Path) -> tuple[int, int] | None:
+    """(st_dev, st_ino), or None where the filesystem cannot tell files apart (st_ino 0)."""
+
+    st = path.stat()
+    return (st.st_dev, st.st_ino) if st.st_ino else None
+
+
+def _resolved_identity(path: Path) -> tuple[int, int] | None:
+    """_file_identity, or None when the name does not resolve to a file that can be stat'ed."""
+
+    try:
+        return _file_identity(path)
+    except OSError:
+        return None
+
+
+def _name_exists(path: Path) -> bool:
+    """Whether the name is there, even as a link that no longer resolves.
+
+    Only a missing name is False: Codex signs out with remove_file, which removes the name.
+    Any other failure to look it up propagates rather than passing for a sign-out.
+    """
+
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _share_sign_in(source: Path, target: Path) -> tuple[tuple[int, int], str]:
+    """Hard-link `target` to the user's real sign-in, or refuse. Never a symlink or a copy."""
+
+    try:
+        os.link(source, target)
+    except OSError as exc:
+        raise RuntimeError(
+            f"Codex CLI: cannot share your sign-in with the isolated home ({exc}). Refusing to "
+            "copy it: Codex rotates its refresh token, and a refresh into a copy would sign "
+            "you out of Codex everywhere else."
+        ) from exc
+    identity = _file_identity(target)
+    if identity is None or identity != _file_identity(source):
+        target.unlink(missing_ok=True)
+        raise RuntimeError(
+            "Codex CLI: this filesystem cannot confirm that the isolated sign-in is your real "
+            "one; refusing to run Codex on it."
+        )
+    return identity, hashlib.sha256(target.read_bytes()).hexdigest()
+
+
+def _is_valid_json(data: bytes) -> bool:
+    try:
+        json.loads(data)
+    except ValueError:
+        return False
+    return True
+
+
+def _keep_aside(real: Path, data: bytes) -> Path:
+    """Store `data` next to `real` under a new, unique, owner-only name. Never overwrites."""
+
+    fd, name = tempfile.mkstemp(prefix=f"{real.name}.council-", suffix=".json", dir=real.parent)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
+    return Path(name)
+
+
+def _check_shared_sign_in(shared: _SharedSignIn) -> None:
+    """After the call, report what the two names show - never repair the real file.
+
+    - Both names still share one file: if it no longer parses on two reads, a Codex ended in
+      the middle of its in-place save cut it short; by then its refresh token has rotated, so
+      the only fix is to sign in again.
+    - They no longer share one file (either side was replaced), or that cannot be confirmed
+      (the real name no longer resolves, e.g. a dangling link), and the call's side holds a
+      save the call made: that sign-in may exist nowhere else, so it is kept aside and
+      reported.
+    - A name is gone: a sign-out - in the call's home, or elsewhere, which wins; nothing is
+      recreated or kept. Only a missing name counts; any other failure is reported.
+    """
+
+    real, isolated = shared.real, shared.isolated
+    try:
+        if not _name_exists(isolated) or not _name_exists(real):
+            return
+        still_shared = (
+            _resolved_identity(isolated) == shared.identity
+            and _resolved_identity(real) == shared.identity
+        )
+        if still_shared:
+            if not _is_valid_json(real.read_bytes()) and not _is_valid_json(real.read_bytes()):
+                logger.warning(
+                    "Codex CLI: a Codex process ended while saving your sign-in and %s is now "
+                    "unreadable. Sign in again with `codex login`.",
+                    real,
+                )
+            return
+        data = isolated.read_bytes()
+        if hashlib.sha256(data).hexdigest() == shared.digest:
+            return
+        try:
+            kept = _keep_aside(real, data)
+        except OSError as exc:
+            logger.warning(
+                "Codex CLI: Codex saved a sign-in during a council call that %s may not hold, "
+                "and it could not be kept (%s), so it is lost with the call's home. If Codex "
+                "asks you to sign in, run `codex login`.",
+                real,
+                exc,
+            )
+            return
+        logger.warning(
+            "Codex CLI: Codex saved a sign-in during a council call that %s may not hold: the "
+            "two no longer share one file, or that could not be confirmed. If Codex asks you "
+            "to sign in, run `codex login`. The call's version was kept as %s; delete it once "
+            "you no longer need it.",
+            real,
+            kept,
+        )
+    except OSError as exc:
+        logger.warning(
+            "Codex CLI: could not check the sign-in %s shared with a council call (%s). If "
+            "Codex asks you to sign in, run `codex login`.",
+            real,
+            exc,
+        )
+
+
 def _remove_call_files(cli_home: str | None, temp_paths: tuple[str, ...]) -> None:
     """Remove what one call left on disk: its temp files and its isolated home.
 
@@ -615,6 +769,8 @@ class CodexCLIProvider(ProviderAdapter):
         self._timeout = timeout
         self._login_status_checked = False
         self._login_status_cache: str | None = None
+        # isolated home -> the real sign-in it shares, for the post-call check
+        self._shared_sign_ins: dict[str, _SharedSignIn] = {}
 
     def _build_command(
         self,
@@ -677,21 +833,31 @@ class CodexCLIProvider(ProviderAdapter):
         }
 
     def _copy_isolated_runtime_state(self, codex_dir: Path) -> None:
-        """Copy only the auth material needed for isolated Codex subprocesses.
+        """Share the user's Codex sign-in with the isolated home, and nothing else.
 
-        Required on every platform now that `CODEX_HOME` points Codex at this directory:
-        with no credentials here it answers `401 Unauthorized: Missing bearer` and does
-        NOT fall back to the real profile (measured 2026-09-20). The copy lives only for
-        the call and is removed by `_remove_call_files`.
+        Required on every platform: `CODEX_HOME` points Codex here, and with no
+        credentials it answers `401 Unauthorized: Missing bearer` without falling back
+        (measured 2026-09-20). auth.json is hard-linked, so a rotated refresh token lands
+        in the user's real file the moment Codex writes it; where that is impossible the
+        call is refused rather than run on a copy.
         """
 
         source_dir = Path.home() / ".codex"
-        for filename in ("auth.json", ".credentials.json"):
+        sign_in = source_dir / _SIGN_IN_FILE
+        if sign_in.exists():
+            isolated = codex_dir / _SIGN_IN_FILE
+            identity, digest = _share_sign_in(sign_in, isolated)
+            self._shared_sign_ins[str(codex_dir.parent)] = _SharedSignIn(
+                sign_in, isolated, identity, digest
+            )
+        for filename in _COPIED_FILES:
             source = source_dir / filename
-            target = codex_dir / filename
-            if source.exists():
-                with contextlib.suppress(OSError):
-                    shutil.copy2(source, target)
+            if not source.exists():
+                continue
+            try:
+                shutil.copy2(source, codex_dir / filename)
+            except OSError as exc:
+                logger.warning("Codex CLI: could not copy %s: %s", filename, exc)
 
     def _create_isolated_cli_home(self) -> str:
         """Create an isolated HOME so nested Codex runs do not inherit tools/plugins."""
@@ -704,7 +870,11 @@ class CodexCLIProvider(ProviderAdapter):
             cli_home = Path(tempfile.mkdtemp(prefix="llm-council-codex-home-"))
         codex_dir = cli_home / ".codex"
         codex_dir.mkdir(parents=True, exist_ok=True)
-        self._copy_isolated_runtime_state(codex_dir)
+        try:
+            self._copy_isolated_runtime_state(codex_dir)
+        except BaseException:
+            shutil.rmtree(cli_home, ignore_errors=True)
+            raise
         return str(cli_home)
 
     def _request_timeout(self, request: GenerateRequest) -> float:
@@ -1106,6 +1276,14 @@ class CodexCLIProvider(ProviderAdapter):
             # may stop the rest of the cleanup.
             with contextlib.suppress(Exception):
                 _close_job(job)
+            # Only now that no Codex is left running, and before its home is removed.
+            if cli_home:
+                shared = self._shared_sign_ins.pop(cli_home, None)
+                if shared is not None:
+                    try:
+                        _check_shared_sign_in(shared)
+                    except Exception:
+                        logger.exception("Codex CLI: the shared sign-in check failed")
             temp_paths = tuple(p for p in (output_path, schema_path, stdin_path) if p)
             if cli_home or temp_paths:
                 remover = threading.Thread(
