@@ -72,13 +72,22 @@ _ENV_DENYLIST_PREFIXES = (
 # with a full answer after the adapter had given up on it.
 _STALL_SECONDS_ENV = "LLM_COUNCIL_CODEX_STALL_SECONDS"
 
+# An isolated CODEX_HOME does not load the user's config.toml, so Codex sends no effort
+# at all: measured on 0.154.0, `-m gpt-5.6-sol` under an isolated home reports
+# `reasoning effort: none`, and `xhigh` with the real profile. The default here is what
+# that profile asks for, so isolating changes where Codex writes without quietly
+# changing how hard it thinks.
+_REASONING_EFFORT_ENV = "LLM_COUNCIL_CODEX_REASONING_EFFORT"
+_DEFAULT_REASONING_EFFORT = "xhigh"
+
 # Windows only. After `turn.completed` Codex needs a few seconds to shut down by itself
-# (measured: launcher gone after 3.3 s, the whole tree after 4.5 s), and on Windows it
-# ignores the isolated HOME and works in the real `~/.codex`. Ending it mid-shutdown
-# could cut off a write there, so a finished turn gets up to this long for its whole
-# tree to go before it is ended; the wait is over as soon as the job is empty.
-# Deadlines, stalls and cancellation never wait. Not needed once the isolation really
-# holds on Windows.
+# (measured: launcher gone after 3.3 s, the whole tree after 4.5 s), so a finished turn
+# gets up to this long for its whole job to empty before the tree is ended; the wait is
+# over as soon as it does. Deadlines, stalls and cancellation never wait.
+# The original reason was that Codex wrote to the user's REAL profile, which CODEX_HOME
+# now prevents. It is kept because it is nearly free and still the difference between
+# 0 and 3 of 18 processes being force-killed mid-write to the throwaway home - a killed
+# writer there leaves a locked file that the cleanup then has to retry around.
 _NATURAL_EXIT_GRACE_SECONDS = 10.0
 
 _CREATE_SUSPENDED = 0x00000004
@@ -622,6 +631,9 @@ class CodexCLIProvider(ProviderAdapter):
         cmd.extend(shlex.split(self._default_flags))
         cmd.extend(["--json", "--color", "never"])
         cmd.extend(["-m", model])
+        effort = self._reasoning_effort()
+        if effort:
+            cmd.extend(["-c", f"model_reasoning_effort={effort}"])
         if output_schema_path:
             cmd.extend(["--output-schema", output_schema_path])
         if output_last_message_path:
@@ -630,6 +642,22 @@ class CodexCLIProvider(ProviderAdapter):
         # prompt is fed via stdin in generate(), NOT argv. Windows
         # CreateProcess caps the command line at ~32KB; schema+prompt exceed it.
         return cmd
+
+    def _reasoning_effort(self) -> str:
+        """The reasoning effort to ask for, or "" to leave it to Codex.
+
+        An isolated `CODEX_HOME` has no `config.toml`, so without this the CLI reports
+        `reasoning effort: none` and the profile's `xhigh` is silently lost. Set
+        `LLM_COUNCIL_CODEX_REASONING_EFFORT` to override, or to empty to opt out.
+        Codex does NOT check the value - `bogusvalue` reaches its banner unchanged - so
+        anything that is not a bare word is dropped here instead of reaching the CLI.
+        """
+
+        raw = os.environ.get(_REASONING_EFFORT_ENV)
+        effort = _DEFAULT_REASONING_EFFORT if raw is None else raw.strip()
+        if not effort:
+            return ""
+        return effort if effort.replace("_", "").isalnum() else _DEFAULT_REASONING_EFFORT
 
     def _check_unsafe_flags(self) -> None:
         """Emit warning if using unsafe permissive flags."""
@@ -649,13 +677,14 @@ class CodexCLIProvider(ProviderAdapter):
         }
 
     def _copy_isolated_runtime_state(self, codex_dir: Path) -> None:
-        """Copy only the auth material needed for isolated Codex subprocesses."""
+        """Copy only the auth material needed for isolated Codex subprocesses.
 
-        if sys.platform == "win32":
-            # Codex ignores the isolated HOME on Windows and signs in from the real
-            # ~/.codex (verified: it answers with nothing copied here). A copy would
-            # only be a second credential on disk that nothing reads.
-            return
+        Required on every platform now that `CODEX_HOME` points Codex at this directory:
+        with no credentials here it answers `401 Unauthorized: Missing bearer` and does
+        NOT fall back to the real profile (measured 2026-09-20). The copy lives only for
+        the call and is removed by `_remove_call_files`.
+        """
+
         source_dir = Path.home() / ".codex"
         for filename in ("auth.json", ".credentials.json"):
             source = source_dir / filename
@@ -808,7 +837,14 @@ class CodexCLIProvider(ProviderAdapter):
                 output_schema_path=schema_path,
             )
             env = self._get_subprocess_env()
+            # HOME is what Codex uses on POSIX; on Windows it ignores it entirely, which
+            # is why the isolation silently did nothing there. CODEX_HOME is the
+            # documented variable for both config and auth (`codex exec --help`:
+            # "--ignore-user-config ... auth still uses CODEX_HOME") and is what keeps a
+            # nested run out of the user's real profile - which on this machine is the
+            # live desktop app's 19 GB directory, memories and goals included.
             env["HOME"] = cli_home
+            env["CODEX_HOME"] = str(Path(cli_home) / ".codex")
             # Safe: uses argument list, no shell; minimal environment.
             # The prompt is handed over as the child's stdin: the child gets its
             # own dup of the descriptor, so the parent's handle closes here.

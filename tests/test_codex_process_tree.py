@@ -664,13 +664,20 @@ class TestSpawnOptions:
             assert "creationflags" not in seen
 
 
-class TestNoSpareCredentialOnWindows:
-    def test_the_sign_in_is_copied_only_where_the_isolated_home_is_read(
+class TestTheIsolatedHomeIsWhatCodexReads:
+    """`CODEX_HOME`, not `HOME`, is the variable Codex resolves config and auth from.
+
+    Measured 2026-09-20 on codex-cli 0.154.0: with `HOME` alone Codex on Windows used the
+    user's real profile - a 19 GB live desktop-app directory - writing its memories, goals,
+    thread history and a session rollout on every council call. With `CODEX_HOME` set, all of
+    that lands in the throwaway home instead. An EMPTY `CODEX_HOME` answers
+    `401 Unauthorized: Missing bearer` and does not fall back, so the credential copy is
+    required for the seat to work at all.
+    """
+
+    def test_the_sign_in_is_copied_on_every_platform(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # On Windows Codex ignores the isolated HOME and signs in from the real ~/.codex
-        # (verified live: it answers with nothing copied), so a copy there is only a second
-        # credential on disk - the thing that was found in 20 leaked homes.
         home = tmp_path / "home"
         (home / ".codex").mkdir(parents=True)
         (home / ".codex" / "auth.json").write_text('{"fake": "token"}', encoding="utf-8")
@@ -678,8 +685,81 @@ class TestNoSpareCredentialOnWindows:
 
         cli_home = Path(CodexCLIProvider(cli_path="codex")._create_isolated_cli_home())
 
-        copied = [p.name for p in (cli_home / ".codex").iterdir()]
-        assert copied == ([] if sys.platform == "win32" else ["auth.json"])
+        assert [p.name for p in (cli_home / ".codex").iterdir()] == ["auth.json"]
+
+    @pytest.mark.asyncio
+    async def test_codex_home_points_at_the_isolated_directory(self, tmp_path: Path) -> None:
+        provider = CodexCLIProvider(cli_path="codex")
+        process = AsyncMock()
+        process.communicate.return_value = (b"", b"")
+        process.returncode = 0
+        seen: dict[str, object] = {}
+
+        def _fake_exec(*_args: object, **kwargs: object) -> AsyncMock:
+            seen.update(kwargs)
+            return process
+
+        cli_home = tmp_path / "cli-home"
+        with (
+            patch.object(provider, "_create_isolated_cli_home", return_value=str(cli_home)),
+            patch("asyncio.create_subprocess_exec", side_effect=_fake_exec),
+        ):
+            await provider.generate(GenerateRequest(prompt="test"))
+
+        env = seen["env"]
+        assert isinstance(env, dict)
+        assert env["CODEX_HOME"] == str(cli_home / ".codex"), "Codex would use the real profile"
+        assert env["HOME"] == str(cli_home), "still set, for the platforms that read it"
+
+    @pytest.mark.asyncio
+    async def test_the_reasoning_effort_is_asked_for_explicitly(self, tmp_path: Path) -> None:
+        """The isolated home has no config.toml, and the effort is then not sent at all.
+
+        Measured 2026-09-20 on codex-cli 0.154.0: `-m gpt-5.6-sol` under an isolated
+        home reports `reasoning effort: none`; adding `-c model_reasoning_effort=xhigh`
+        reports `xhigh`, which is what the user's real config.toml asks for.
+        """
+        provider = CodexCLIProvider(cli_path="codex")
+        process = AsyncMock()
+        process.communicate.return_value = (b"", b"")
+        process.returncode = 0
+        argv: list[str] = []
+
+        def _fake_exec(*args: object, **kwargs: object) -> AsyncMock:
+            argv.extend(str(a) for a in args)
+            return process
+
+        with (
+            patch.object(provider, "_create_isolated_cli_home", return_value=str(tmp_path / "h")),
+            patch("asyncio.create_subprocess_exec", side_effect=_fake_exec),
+        ):
+            await provider.generate(GenerateRequest(prompt="test"))
+
+        assert "-c" in argv
+        assert f"model_reasoning_effort={codex_module._DEFAULT_REASONING_EFFORT}" in argv
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            (None, "xhigh"),
+            ("high", "high"),
+            ("  medium  ", "medium"),
+            ("", ""),
+            ("   ", ""),
+            ("--sandbox danger-full-access", "xhigh"),
+            ("a b", "xhigh"),
+        ],
+    )
+    def test_the_effort_override_is_bounded(
+        self, monkeypatch: pytest.MonkeyPatch, raw: str | None, expected: str
+    ) -> None:
+        """Empty opts out; anything that is not a bare word never reaches the argument list."""
+        if raw is None:
+            monkeypatch.delenv(codex_module._REASONING_EFFORT_ENV, raising=False)
+        else:
+            monkeypatch.setenv(codex_module._REASONING_EFFORT_ENV, raw)
+
+        assert CodexCLIProvider(cli_path="codex")._reasoning_effort() == expected
 
 
 class TestTheIsolatedHomeIsRemoved:
