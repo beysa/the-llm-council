@@ -1371,7 +1371,10 @@ class Orchestrator:
                             response = await asyncio.wait_for(
                                 _consume_stream(result), timeout=watchdog_timeout
                             )
-                    except TimeoutError as timeout_exc:
+                    except (TimeoutError, asyncio.TimeoutError) as timeout_exc:
+                        # Both names on purpose: until Python 3.11 asyncio.TimeoutError
+                        # is a separate class, so `except TimeoutError` alone never
+                        # caught the watchdog on 3.10.
                         # asyncio.wait_for raises a BARE TimeoutError: str() is "",
                         # which classify_error() can only read as UNKNOWN. Re-raise
                         # with the facts a caller actually needs to act on.
