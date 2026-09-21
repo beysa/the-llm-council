@@ -75,6 +75,10 @@ claude-code = "llm_council.providers.cli.claude_code:ClaudeCodeCLIProvider"
 codex-cli = "llm_council.providers.cli.codex:CodexCLIProvider"
 gemini-cli = "llm_council.providers.cli.gemini_cli:GeminiCLIProvider"
 sakana = "llm_council.providers.sakana:SakanaProvider"
+ollama = "llm_council.providers.ollama:OllamaProvider"
+ollama-kimi = "llm_council.providers.ollama:OllamaKimiProvider"
+ollama-deepseek = "llm_council.providers.ollama:OllamaDeepSeekProvider"
+ollama-qwen = "llm_council.providers.ollama:OllamaQwenProvider"
 
 [project.urls]
 Homepage = "https://github.com/sherifkozman/the-llm-council"
