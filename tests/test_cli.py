@@ -9,13 +9,13 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
+from conftest import isolate_home
 from typer.testing import CliRunner
 
 from llm_council.cli.main import _load_provider_configs, app
 from llm_council.eval_import import ImportedPullRequest
 from llm_council.providers.base import GenerateResponse
 from llm_council.storage.artifacts import ArtifactStore, ArtifactType
-from tests.conftest import isolate_home
 
 runner = CliRunner()
 

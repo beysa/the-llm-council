@@ -27,6 +27,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from test_orchestrator import CaptureProvider
 
 from llm_council.engine.orchestrator import (
     Orchestrator,
@@ -35,7 +36,6 @@ from llm_council.engine.orchestrator import (
 )
 from llm_council.providers.base import GenerateRequest
 from llm_council.storage import ArtifactStore, ArtifactType, Phase
-from tests.test_orchestrator import CaptureProvider
 
 SCHEMA = {
     "type": "object",
