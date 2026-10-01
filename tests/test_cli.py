@@ -4,19 +4,23 @@ from __future__ import annotations
 
 import asyncio
 import json
+import locale
 import os
 import re
 import stat
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+import typer
+import yaml
 from conftest import isolate_home
 from typer.testing import CliRunner
 
-from llm_council.cli.main import _load_provider_configs, app
+from llm_council.cli.main import _cli_state, _load_config_defaults, _load_provider_configs, app
 from llm_council.eval_import import ImportedPullRequest
 from llm_council.providers.base import GenerateResponse
 from llm_council.storage.artifacts import ArtifactStore, ArtifactType
@@ -849,6 +853,171 @@ class TestCLIConfigSet:
         assert config_file.read_bytes() == _COMMENTED_CONFIG.encode("utf-8")
         assert sorted(p.name for p in config_file.parent.iterdir()) == ["config.yaml"]
         assert "No space left on device" in result.output
+
+
+class TestConfigEnvReferences:
+    """`${VAR}` in the config is expanded for use only: not on display, not from argv.
+
+    The Windows-specific cases pass either way on other platforms, where nothing in
+    the old code path behaved differently.
+    """
+
+    def test_get_shows_the_value_as_written(self, isolated_home, monkeypatch):
+        """--get printed expanded values, so `--get providers` showed the API key."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-must-not-be-printed")
+        _write_council_config(isolated_home, _COMMENTED_CONFIG)
+
+        result = runner.invoke(app, ["config", "--get", "providers"])
+
+        assert result.exit_code == 0, result.output
+        assert "sk-or-must-not-be-printed" not in result.output
+        assert json.loads(result.output)[0]["api_key"] == "${OPENROUTER_API_KEY}"
+
+    @pytest.mark.parametrize(
+        "before_key",
+        [
+            "# don't inline keys\n",  # an apostrophe in a comment...
+            "defaults:\n  context: Don't guess\n",  # ...or in an earlier value
+        ],
+    )
+    def test_an_apostrophe_does_not_stop_expansion(self, isolated_home, monkeypatch, before_key):
+        """Windows' ntpath.expandvars copies text between single quotes as it is, so one
+        apostrophe above the key sent the literal `${FAKE_PROBE_KEY}` to the provider."""
+        monkeypatch.setenv("FAKE_PROBE_KEY", "sk-or-test")
+        _write_council_config(
+            isolated_home,
+            before_key + "providers:\n  - name: openrouter\n    api_key: ${FAKE_PROBE_KEY}\n",
+        )
+
+        assert _load_provider_configs() == {"openrouter": {"api_key": "sk-or-test"}}
+
+    def test_a_single_quoted_value_expands_like_elsewhere(self, isolated_home, monkeypatch):
+        """`'${VAR}'` expanded on Linux and macOS but stayed literal on Windows."""
+        monkeypatch.setenv("FAKE_PROBE_KEY", "sk-or-test")
+        _write_council_config(isolated_home, "defaults:\n  context: '${FAKE_PROBE_KEY}'\n")
+
+        assert _load_config_defaults()["context"] == "sk-or-test"
+
+    @pytest.mark.skipif(os.name != "nt", reason="only Windows expands %VAR%")
+    def test_percent_references_still_load_on_windows(self, isolated_home, monkeypatch):
+        """Only the quote handling changed. With plain shell-style expansion a value
+        starting with an unexpanded `%` is invalid YAML, and the whole config loaded as {}."""
+        monkeypatch.setenv("FAKE_PROBE_KEY", "sk-or-test")
+        _write_council_config(
+            isolated_home,
+            "providers:\n  - name: openrouter\n    api_key: %FAKE_PROBE_KEY%\n"
+            "defaults:\n  timeout: 55\n",
+        )
+
+        assert _load_provider_configs() == {"openrouter": {"api_key": "sk-or-test"}}
+        assert _load_config_defaults() == {"timeout": 55}
+
+    def test_config_is_read_as_utf8(self, isolated_home):
+        """It was decoded with the locale encoding: cp1254 on a Turkish Windows."""
+        _write_council_config(isolated_home, "defaults:\n  context: Türkçe yanıt ver\n")
+
+        assert _load_config_defaults()["context"] == "Türkçe yanıt ver"
+        shown = runner.invoke(app, ["config", "--show"])
+        assert "Türkçe yanıt ver" in shown.output
+
+    def test_config_with_a_utf8_bom_loads(self, isolated_home):
+        """Notepad and PowerShell 5 write a BOM; decoded as cp1254 it joined the first key."""
+        config_file = _write_council_config(isolated_home, "")
+        config_file.write_bytes(b"\xef\xbb\xbfdefaults:\n  timeout: 55\n")
+
+        assert _load_config_defaults() == {"timeout": 55}
+
+    def test_config_in_the_locale_encoding_still_loads(self, isolated_home):
+        """A file saved in the locale encoding, which is how this used to read it, still works."""
+        encoding = locale.getpreferredencoding(False)
+        try:
+            data = "defaults:\n  context: Türkçe\n".encode(encoding)
+            data.decode("utf-8")
+        except UnicodeEncodeError:
+            pytest.skip(f"{encoding} cannot encode the sample")
+        except UnicodeDecodeError:
+            pass  # not UTF-8, so loading it takes the fallback
+        else:
+            pytest.skip(f"{encoding} bytes are valid UTF-8; there is no fallback to take")
+        config_file = _write_council_config(isolated_home, "")
+        config_file.write_bytes(data)
+
+        assert _load_config_defaults()["context"] == "Türkçe"
+
+    def test_entry_point_keeps_env_references_in_arguments(
+        self, isolated_home, monkeypatch, capsys
+    ):
+        """On Windows Typer expanded $VAR and %VAR% in sys.argv before any council code ran,
+        so `council config --set k '${OPENROUTER_API_KEY}'` wrote the key. CliRunner passes
+        arguments directly and never takes that path, so this calls app() like the script."""
+        monkeypatch.setenv("FAKE_PROBE_KEY", "sk-or-must-not-reach-disk")
+        config_file = _write_council_config(isolated_home, "a: 1\n")
+        literal = "${FAKE_PROBE_KEY} %FAKE_PROBE_KEY%"
+        monkeypatch.setattr(sys, "argv", ["council", "config", "--set", "k", literal])
+        # app() replaces sys.excepthook and _cli_state; registering them puts them back.
+        monkeypatch.setattr(sys, "excepthook", sys.excepthook)
+        monkeypatch.setitem(_cli_state, "config_path", None)
+
+        with pytest.raises(SystemExit) as exited:
+            app()
+
+        assert exited.value.code == 0, capsys.readouterr().out
+        assert yaml.safe_load(config_file.read_bytes()) == {"a": 1, "k": literal}
+
+    @pytest.mark.skipif(os.name != "nt", reason="only Windows expands arguments itself")
+    def test_entry_point_still_globs_arguments_on_windows(self, tmp_path, monkeypatch, capsys):
+        """cmd.exe and PowerShell do not glob, so a single-match wildcard relies on this
+        expansion; only the variable step was dropped."""
+        (tmp_path / "only-match.yaml").write_text("a: 1\n")
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(sys, "argv", ["council", "--config", "*.yaml", "config", "--path"])
+        # app() replaces sys.excepthook and _cli_state; registering them puts them back.
+        monkeypatch.setattr(sys, "excepthook", sys.excepthook)
+        monkeypatch.setitem(_cli_state, "config_path", None)
+
+        with pytest.raises(SystemExit) as exited:
+            app()
+
+        assert exited.value.code == 0
+        assert capsys.readouterr().out.strip().endswith("only-match.yaml")
+
+
+class TestWindowsArgumentExpansion:
+    """What `app()` hands to typer on Windows; the platform is patched, so this runs anywhere."""
+
+    @pytest.fixture
+    def handed_to_typer(self, monkeypatch, tmp_path):
+        calls = []
+        monkeypatch.setattr("llm_council.cli.main._ON_WINDOWS", True)
+        monkeypatch.setattr(typer.Typer, "__call__", lambda _, *a, **kw: calls.append((a, kw)))
+        monkeypatch.setenv("FAKE_PROBE_KEY", "sk-or-must-stay-a-reference")
+        (tmp_path / "only-match.md").write_text("x")
+        monkeypatch.chdir(tmp_path)
+        argv = ["council", "run", "${FAKE_PROBE_KEY}", "$FAKE_PROBE_KEY", "only*.md"]
+        monkeypatch.setattr(sys, "argv", argv)
+        return calls
+
+    @pytest.mark.parametrize(("args", "kwargs"), [((), {}), ((None,), {}), ((), {"args": None})])
+    def test_the_script_call_expands_wildcards_but_not_variables(
+        self, handed_to_typer, args, kwargs
+    ):
+        """`app()`, `app(None)` and `app(args=None)` all leave argv to click."""
+        app(*args, **kwargs)
+
+        ((passed_args, passed_kwargs),) = handed_to_typer
+        argv = passed_args[0] if passed_args else passed_kwargs["args"]
+        assert argv == ["run", "${FAKE_PROBE_KEY}", "$FAKE_PROBE_KEY", "only-match.md"]
+        assert passed_kwargs["windows_expand_args"] is False
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [{"windows_expand_args": True}, {"windows_expand_args": False}, {"args": ["--help"]}],
+    )
+    def test_explicit_choices_are_passed_through(self, handed_to_typer, kwargs):
+        """A caller that sets the arguments or the expansion itself gets exactly that."""
+        app(**kwargs)
+
+        assert handed_to_typer == [((), kwargs)]
 
 
 class TestOutputFormatConfig:

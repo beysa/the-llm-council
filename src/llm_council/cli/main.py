@@ -17,6 +17,7 @@ import asyncio
 import contextlib
 import copy
 import json
+import locale
 import logging
 import os
 import shutil
@@ -26,6 +27,7 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
 
+import click
 import httpx
 import typer
 import yaml
@@ -98,7 +100,35 @@ def _version_callback(value: bool) -> None:
         raise typer.Exit()
 
 
-app = typer.Typer(
+_ON_WINDOWS = os.name == "nt"  # a module constant, so tests can take the Windows path anywhere
+
+
+class _CouncilTyper(typer.Typer):
+    """``typer.Typer`` whose console entry point leaves ``$VAR``/``%VAR%`` in arguments alone.
+
+    On Windows, Typer passes ``sys.argv`` through click's ``_expand_args``, which expands
+    environment variables as well as ``~`` and wildcards. That turned a typed
+    ``'${OPENROUTER_API_KEY}'`` into the key itself before any council code ran, so
+    ``config --set`` wrote it to disk. Shells already expand the variables a user did not
+    quote, so only that step is dropped. ``~`` and wildcards are expanded as before, since
+    cmd.exe and PowerShell do neither for ``~/notes.md`` or a single-match ``*.md``.
+    """
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        argv = args[0] if args else kwargs.get("args")
+        # Only a call that leaves argv to click (the console script's `app()`) is changed;
+        # an explicit windows_expand_args is the caller's own choice.
+        if _ON_WINDOWS and argv is None and "windows_expand_args" not in kwargs:
+            expanded = click.utils._expand_args(sys.argv[1:], env=False)
+            if args:
+                args = (expanded, *args[1:])
+            else:
+                kwargs["args"] = expanded
+            kwargs["windows_expand_args"] = False
+        return super().__call__(*args, **kwargs)
+
+
+app = _CouncilTyper(
     name="council",
     help="Multi-LLM Council Framework - Orchestrate multiple LLM backends",
     no_args_is_help=True,
@@ -197,15 +227,33 @@ def _get_config_file() -> Path:
     return Path.home() / ".config" / "llm-council" / "config.yaml"
 
 
-def _load_config() -> dict[str, Any]:
-    """Load full config from file if it exists."""
+def _read_config_text(config_file: Path) -> str:
+    """The config file's text: UTF-8, or the locale encoding it used to be read with."""
+    data = config_file.read_bytes()
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode(locale.getpreferredencoding(False))
+
+
+def _load_config(*, expand_env: bool = True) -> dict[str, Any]:
+    """Load full config from file if it exists.
+
+    ``${VAR}`` references are expanded for use; ``expand_env=False`` gives the values as
+    written, for anything shown to the user.
+    """
     config_file = _get_config_file()
     if not config_file.exists():
         return {}
 
     try:
-        raw = config_file.read_text()
-        return yaml.safe_load(os.path.expandvars(raw)) or {}
+        raw = _read_config_text(config_file)
+        if expand_env:
+            # On Windows os.path.expandvars (ntpath) copies text between single quotes as
+            # it is, so one apostrophe in a comment stopped every later ${VAR}. NUL cannot
+            # occur in YAML or in an env value, so it stands in for "'" meanwhile.
+            raw = os.path.expandvars(raw.replace("'", "\0")).replace("\0", "'")
+        return yaml.safe_load(raw) or {}
     except (yaml.YAMLError, OSError):
         return {}
 
@@ -2022,7 +2070,7 @@ def config(
     # --show: Show current configuration
     if show:
         if config_file.exists():
-            console.print(config_file.read_text())
+            console.print(_read_config_text(config_file))
         else:
             console.print("[yellow]No configuration file found.[/yellow]")
             console.print(f"Run 'council config --init' to create one at {config_file}")
@@ -2060,7 +2108,7 @@ defaults:
             raise typer.Exit(1)
 
         try:
-            config_data = yaml.safe_load(config_file.read_text())
+            config_data = yaml.safe_load(_read_config_text(config_file))
             if not isinstance(config_data, dict):
                 console.print("[red]Error:[/red] Configuration must be a YAML dictionary")
                 raise typer.Exit(1)
@@ -2086,7 +2134,7 @@ defaults:
             console.print("[red]Error:[/red] No configuration file found")
             raise typer.Exit(1)
 
-        config_data = _load_config()
+        config_data = _load_config(expand_env=False)  # never print a resolved secret
         value = _get_nested_value(config_data, get_key)
         if value is None:
             console.print(f"[yellow]Key not found:[/yellow] {get_key}")
