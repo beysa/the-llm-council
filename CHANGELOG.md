@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `council config --set` no longer writes expanded `${VAR}` secrets to disk, drops
+  comments, or replaces an unparseable config with the single key being set. It now
+  edits the value in place, checks that the result re-parses to exactly the intended
+  change, and writes atomically. When an edit cannot be made safely it refuses and
+  leaves the file untouched. That covers anchors and aliases, values holding comments,
+  paths through lists, empty sections, and non-UTF-8 or read-only files.
+- `council config --get` prints values as written instead of resolving `${VAR}`
+  references, so `--get providers` no longer shows API keys.
+- Windows: an apostrophe anywhere in the config, in a comment or a value, no longer
+  stops `${VAR}` expansion for the rest of the file. Before, the provider received the
+  literal `${VAR}` as its key. Single-quoted values now expand as they do on other
+  platforms.
+- Windows: the config is read as UTF-8, falling back to the locale encoding. This
+  applies to loading and to `config --show` and `--validate`. Before, non-ASCII text
+  and a UTF-8 BOM were garbled.
+- Windows: `$VAR` and `%VAR%` typed in command-line arguments are no longer expanded
+  before council sees them, so `council config --set k '${VAR}'` stores the reference,
+  not its value. `~` and wildcards are still expanded.
+
+### Changed
+- Windows: council no longer expands environment variables in command-line arguments
+  itself. Let the shell expand them instead: `$env:VAR` in PowerShell, `%VAR%` in
+  cmd.exe.
+
 ## [0.8.0] - 2026-07-22
 
 ### Fixed

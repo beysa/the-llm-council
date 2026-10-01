@@ -251,6 +251,8 @@ defaults:
 
 Config values support standard shell-style environment expansion such as `${OPENROUTER_API_KEY}` at load time. That expansion only affects values declared in `config.yaml`; if a provider config omits a field, the adapter still falls back to its normal provider-specific environment variables. For ad hoc provider selection, you can still override the model at runtime with `--models`.
 
+The references are resolved only when council uses the config: `council config --get` and `council config --set` show and write them as written, never their values.
+
 Initialize config file:
 
 ```bash
