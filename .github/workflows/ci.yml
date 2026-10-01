@@ -58,3 +58,31 @@ jobs:
           flags: unittests
           name: codecov-umbrella
           fail_ci_if_error: false
+
+  windows-cli:
+    # ${VAR} expansion in the config and in argv works differently on Windows (ntpath,
+    # click's argument expansion); on Linux those regression tests pass either way.
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: "pyproject.toml"
+
+      - name: Install dependencies
+        run: |
+          uv pip install --system -e ".[dev]"
+
+      - name: Run the CLI tests
+        run: |
+          pytest tests/test_cli.py
