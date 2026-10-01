@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
+import stat
 from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -626,6 +628,227 @@ providers:
         result = runner.invoke(app, ["config"])
         assert result.exit_code == 0
         assert "Usage" in result.stdout or "config" in result.stdout
+
+
+# Shaped like a real hand-maintained config: comments, an env reference, a block list.
+_COMMENTED_CONFIG = """\
+# LLM Council Configuration -- notes the user wants kept
+
+providers:
+  - name: openrouter
+    api_key: ${OPENROUTER_API_KEY}  # never inline the real key
+    default_model: anthropic/claude-opus-5
+
+# Default settings for 'council run'
+defaults:
+  providers:
+    - claude
+    - codex
+  timeout: 120
+
+# trailing note
+"""
+
+
+def _write_council_config(home: Path, text: str) -> Path:
+    """Write the default-location config as exact bytes (no newline translation)."""
+    config_file = home / ".config" / "llm-council" / "config.yaml"
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    config_file.write_bytes(text.encode("utf-8"))
+    return config_file
+
+
+class TestCLIConfigSet:
+    """`config --set` edits one value in place and never rewrites the rest of the file."""
+
+    def test_set_rewrites_only_the_target_value(self, isolated_home, monkeypatch):
+        """It used to write expanded ${VAR} secrets to disk and drop every comment."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-must-not-reach-disk")
+        config_file = _write_council_config(isolated_home, _COMMENTED_CONFIG)
+
+        result = runner.invoke(app, ["config", "--set", "defaults.timeout", "600"])
+
+        assert result.exit_code == 0, result.output
+        text = config_file.read_bytes().decode("utf-8")
+        assert "sk-or-must-not-reach-disk" not in text
+        assert text == _COMMENTED_CONFIG.replace("  timeout: 120\n", "  timeout: 600\n")
+
+    @pytest.mark.parametrize(
+        ("key", "value", "inserted"),
+        [
+            ("defaults.max_retries", "5", "  max_retries: 5\n"),
+            ("summary.tier", "actions", "summary:\n  tier: actions\n"),
+        ],
+    )
+    def test_set_inserts_a_new_key_after_its_siblings(self, isolated_home, key, value, inserted):
+        """A new key lands under its parent mapping; comments around it stay put."""
+        config_file = _write_council_config(isolated_home, _COMMENTED_CONFIG)
+
+        result = runner.invoke(app, ["config", "--set", key, value])
+
+        assert result.exit_code == 0, result.output
+        assert config_file.read_bytes().decode("utf-8") == _COMMENTED_CONFIG.replace(
+            "  timeout: 120\n", "  timeout: 120\n" + inserted
+        )
+
+    def test_set_replaces_a_block_list_in_the_same_style(self, isolated_home):
+        """A JSON list value replaces a block list without reformatting it as flow."""
+        config_file = _write_council_config(isolated_home, _COMMENTED_CONFIG)
+
+        result = runner.invoke(
+            app, ["config", "--set", "defaults.providers", '["claude", "codex", "sakana"]']
+        )
+
+        assert result.exit_code == 0, result.output
+        assert config_file.read_bytes().decode("utf-8") == _COMMENTED_CONFIG.replace(
+            "    - codex\n", "    - codex\n    - sakana\n"
+        )
+
+    @pytest.mark.parametrize("newline", ["\n", "\r\n"])
+    def test_set_keeps_the_files_line_endings(self, isolated_home, newline):
+        """Neither LF nor CRLF is translated to the platform default."""
+        original = "defaults:\n  timeout: 120\n".replace("\n", newline)
+        config_file = _write_council_config(isolated_home, original)
+
+        result = runner.invoke(app, ["config", "--set", "defaults.max_retries", "5"])
+
+        assert result.exit_code == 0, result.output
+        expected = "defaults:\n  timeout: 120\n  max_retries: 5\n".replace("\n", newline)
+        assert config_file.read_bytes() == expected.encode("utf-8")
+
+    def test_set_creates_a_missing_config(self, isolated_home):
+        """With no file yet, --set creates one holding just that key, as it always did.
+
+        A new file has no line endings to keep, so it gets the platform's (as --init's does).
+        """
+        config_file = isolated_home / ".config" / "llm-council" / "config.yaml"
+
+        result = runner.invoke(app, ["config", "--set", "defaults.timeout", "600"])
+
+        assert result.exit_code == 0, result.output
+        assert config_file.read_text(encoding="utf-8") == "defaults:\n  timeout: 600\n"
+
+    def test_set_keeps_comments_under_the_section_they_follow(self, isolated_home):
+        """A comment indented under the last entry stays with it, above the new section."""
+        original = "defaults:\n  timeout: 120\n  # raising this breaks CI\n\n# tail\n"
+        config_file = _write_council_config(isolated_home, original)
+
+        result = runner.invoke(app, ["config", "--set", "summary.tier", "actions"])
+
+        assert result.exit_code == 0, result.output
+        assert config_file.read_bytes().decode("utf-8") == original.replace(
+            "  # raising this breaks CI\n",
+            "  # raising this breaks CI\nsummary:\n  tier: actions\n",
+        )
+
+    @pytest.mark.parametrize(
+        ("key", "value", "written"),
+        [
+            # json.loads makes a NaN that never equals the reloaded one under ==.
+            ("limits.ratio", "NaN", "  ratio: .nan\n"),
+            # Key order is the user's, not sorted.
+            ("limits.weights", '{"z": 3, "a": 2}', "  weights: {z: 3, a: 2}\n"),
+            # Non-ASCII is escaped: _load_config() decodes with the locale encoding.
+            ("limits.note", '"Türkçe"', '  note: "T\\xFCrk\\xE7e"\n'),
+        ],
+    )
+    def test_set_writes_values_that_read_back_unchanged(self, isolated_home, key, value, written):
+        """Values whose plain == comparison or encoding could trip up still round-trip."""
+        original = "limits:\n  score: .nan\n"
+        config_file = _write_council_config(isolated_home, original)
+
+        result = runner.invoke(app, ["config", "--set", key, value])
+
+        assert result.exit_code == 0, result.output
+        assert config_file.read_bytes() == (original + written).encode("ascii")
+
+    @pytest.mark.parametrize(
+        ("original", "key", "reason"),
+        [
+            # Unparseable: the old code read this as {} and replaced the file with one key.
+            ("defaults:\n  timeout: [120\n", "defaults.timeout", "while parsing"),
+            # Through a list: no in-place edit can express it.
+            (_COMMENTED_CONFIG, "providers.0.default_model", "providers is a list"),
+            # A section whose children are all commented out holds null.
+            ("defaults:\n  # timeout: 120\n", "defaults.timeout", "defaults is empty"),
+            # The splice is valid YAML but would cut the kept trailing blank line out of
+            # `note`: only the re-parse comparison catches this one.
+            (
+                "defaults:\n  note: |+\n    text\n\nnext: 1\n",
+                "defaults.max_retries",
+                "without altering other values",
+            ),
+            # A scalar at column 0 cannot be the value of an indentless list's key.
+            ("p:\n- a\nn: 1\n", "p", "could not be made in place"),
+            # Through an alias the edit would land on `shared` and change both keys.
+            ("shared: &shared\n  timeout: 120\ndefaults: *shared\n", "defaults.timeout", "aliases"),
+            # Replacing a list would drop the comment inside it...
+            ("p:\n  - a\n  # b is flaky\n  - b\n", "p", "holds comments"),
+            # ...or leave its last item's comment beside the new last item,
+            ("p:\n  - a  # primary\nn: 1\n", "p", "holds comments"),
+            # ...as it would a comment line indented under that item.
+            ("p:\n  - a\n  # b removed: too slow\nn: 1\n", "p", "holds comments"),
+            # A block scalar's header comment is inside its token, but still a comment.
+            ("note: |  # keep this\n  text\nn: 1\n", "note", "holds comments"),
+            # A !!set section is a mapping node but loads as a Python set.
+            ("defaults: !!set\n  ? timeout\n", "defaults.timeout", "not a mapping"),
+        ],
+    )
+    def test_set_refuses_and_leaves_the_file_alone(self, isolated_home, original, key, reason):
+        """When the edit cannot be made in place, nothing is written, and the user is told why."""
+        config_file = _write_council_config(isolated_home, original)
+
+        result = runner.invoke(app, ["config", "--set", key, "600"])
+
+        assert result.exit_code == 1
+        assert config_file.read_bytes() == original.encode("utf-8")
+        assert reason in " ".join(result.output.split())  # rich wraps long lines
+        assert "council config --edit" in result.output
+
+    @pytest.mark.skipif(
+        hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores file permissions"
+    )
+    def test_set_refuses_a_read_only_config(self, isolated_home):
+        """Like the plain write it replaced, the atomic write does not override read-only."""
+        config_file = _write_council_config(isolated_home, _COMMENTED_CONFIG)
+        config_file.chmod(stat.S_IREAD)
+        try:
+            result = runner.invoke(app, ["config", "--set", "defaults.timeout", "600"])
+            entries = sorted(p.name for p in config_file.parent.iterdir())
+        finally:
+            config_file.chmod(stat.S_IREAD | stat.S_IWRITE)
+
+        assert result.exit_code == 1
+        assert config_file.read_bytes() == _COMMENTED_CONFIG.encode("utf-8")
+        assert entries == ["config.yaml"]
+        assert "read-only" in result.output
+
+    def test_set_refuses_a_config_that_is_not_utf8(self, isolated_home):
+        """A locale-encoded file is refused rather than rewritten under another encoding."""
+        config_file = _write_council_config(isolated_home, "")
+        original = "# Türkçe not\ndefaults:\n  timeout: 120\n".encode("cp1254")
+        config_file.write_bytes(original)
+
+        result = runner.invoke(app, ["config", "--set", "defaults.timeout", "600"])
+
+        assert result.exit_code == 1
+        assert config_file.read_bytes() == original
+        assert "utf-8" in result.output
+
+    def test_set_failed_write_leaves_the_old_file_whole(self, isolated_home, monkeypatch):
+        """The new text goes to a temp file first; a failure never truncates the config."""
+        config_file = _write_council_config(isolated_home, _COMMENTED_CONFIG)
+
+        def disk_full(*args, **kwargs):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr("llm_council.cli.main.os.replace", disk_full)
+        result = runner.invoke(app, ["config", "--set", "defaults.timeout", "600"])
+
+        assert result.exit_code == 1
+        assert config_file.read_bytes() == _COMMENTED_CONFIG.encode("utf-8")
+        assert sorted(p.name for p in config_file.parent.iterdir()) == ["config.yaml"]
+        assert "No space left on device" in result.output
 
 
 class TestOutputFormatConfig:

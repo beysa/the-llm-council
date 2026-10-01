@@ -14,11 +14,15 @@ Commands:
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import copy
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
 
@@ -324,6 +328,213 @@ def _set_nested_value(data: dict[str, Any], key: str, value: Any) -> None:
             final_value = value
 
     current[parts[-1]] = final_value
+
+
+_YAML_STR_TAG = "tag:yaml.org,2002:str"
+_YAML_MAP_TAG = "tag:yaml.org,2002:map"
+_YAML_NULL_TAG = "tag:yaml.org,2002:null"
+
+
+def _is_plain_yaml_map(node: Any) -> bool:
+    """A ``!!map`` node; ``!!set`` is a mapping node too but loads as a Python set."""
+    return isinstance(node, yaml.MappingNode) and node.tag == _YAML_MAP_TAG
+
+
+def _yaml_inline(value: Any) -> str:
+    """Render ``value`` as one line of YAML (flow style for collections).
+
+    The output is ASCII, non-ASCII escaped, so the file reads the same whatever encoding
+    ``_load_config()`` decodes it with.
+    """
+    text = yaml.safe_dump(value, default_flow_style=True, sort_keys=False, width=sys.maxsize)
+    # A bare scalar at document level is followed by an explicit document-end marker.
+    text = text.rstrip("\n").removesuffix("\n...")
+    if "\n" in text:
+        raise ValueError("multi-line values cannot be set in place")
+    return text
+
+
+def _yaml_new_keys(parts: list[str], indent: int, value: Any) -> str:
+    """Block YAML for a chain of new keys from column ``indent``, the last one set to ``value``."""
+    lines = [" " * (indent + 2 * i) + _yaml_inline(part) + ":" for i, part in enumerate(parts)]
+    return "\n".join(lines) + " " + _yaml_inline(value)
+
+
+def _yaml_line_end(raw: str, pos: int) -> int:
+    """Offset of the terminator (``\\n`` or ``\\r\\n``) of the line holding ``pos``."""
+    end = raw.find("\n", pos)
+    if end == -1:
+        return len(raw)
+    return end - 1 if raw[end - 1 : end] == "\r" else end
+
+
+def _yaml_content_end(raw: str, node: yaml.Node) -> int:
+    """Offset just past ``node``'s own text, before any trailing blank lines or comments.
+
+    PyYAML ends a block collection where the next token starts, which can be several
+    comment lines further down, so the end is taken from the collection's last child.
+    Backing off trailing whitespace is not right for every block scalar (``|+`` keeps
+    its trailing newlines); the caller's re-parse check is what catches that case.
+    """
+    if isinstance(node, yaml.MappingNode) and not node.flow_style and node.value:
+        return _yaml_content_end(raw, node.value[-1][1])
+    if isinstance(node, yaml.SequenceNode) and not node.flow_style and node.value:
+        return _yaml_content_end(raw, node.value[-1])
+    end = int(node.end_mark.index)
+    while end > node.start_mark.index and raw[end - 1] in " \t\r\n":
+        end -= 1
+    return end
+
+
+def _yaml_has_comment(raw: str, start: int, end: int) -> bool:
+    """Whether ``raw[start:end]`` holds a comment, i.e. a ``#`` outside every YAML token."""
+    spans: list[tuple[int, int]] = []
+    for token in yaml.scan(raw, Loader=yaml.SafeLoader):
+        first = token.start_mark.index
+        if getattr(token, "style", None) in ("|", ">"):
+            # A block scalar's token also covers its header line (`|  # note`), where a
+            # `#` starts a comment; its content begins on the next line.
+            first = _yaml_line_end(raw, first)
+        spans.append((first, token.end_mark.index))
+    return any(raw[i] == "#" and not any(a <= i < b for a, b in spans) for i in range(start, end))
+
+
+def _yaml_block_end(raw: str, node: yaml.Node, indent: int) -> int:
+    """End of the text ``node`` owns: its last line, plus the comment lines below it
+    that are indented deeper than ``indent`` (blank lines between them included).
+
+    A new sibling is inserted here, so such comments stay above it with the entry
+    they describe; a replaced block collection is checked for comments up to here.
+    """
+    offset = scan = _yaml_line_end(raw, _yaml_content_end(raw, node))
+    while scan < len(raw):
+        line_start = raw.find("\n", scan) + 1
+        if not line_start:
+            break
+        line_end = _yaml_line_end(raw, line_start)
+        body = raw[line_start:line_end].lstrip()
+        if body.startswith("#") and line_end - line_start - len(body) > indent:
+            offset = scan = line_end
+        elif not body:
+            scan = line_end
+        else:
+            break
+    return offset
+
+
+def _set_config_value_in_text(raw: str, key: str, value: str) -> str:
+    """Return config text ``raw`` with ``key`` set to ``value``; nothing else is rewritten.
+
+    ``config --set`` used to round-trip the file through ``_load_config()`` and
+    ``yaml.safe_dump``. That wrote expanded ``${ENV_VAR}`` secrets back to disk in
+    plaintext, dropped every comment, and -- since ``_load_config()`` reads a broken
+    file as ``{}`` -- replaced an unparseable config with the one key being set.
+
+    Here the unexpanded text is edited only at the key's own position, and the result
+    must re-parse to the old data with exactly this change. What cannot be edited that
+    way -- anchors and aliases, a value holding comments, a path through a list --
+    raises ValueError (``yaml.YAMLError`` for a file that does not parse), and the
+    caller writes nothing.
+    """
+    data = yaml.safe_load(raw)
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        raise ValueError("the config is not a YAML mapping")
+    # Through an alias the edit would land on the anchor and change every key sharing it.
+    if any(getattr(event, "anchor", None) for event in yaml.parse(raw, Loader=yaml.SafeLoader)):
+        raise ValueError("the config uses YAML anchors or aliases")
+
+    parts = key.split(".")
+    found = yaml.compose(raw, Loader=yaml.SafeLoader)
+    depth = 0
+    while depth < len(parts) and _is_plain_yaml_map(found):
+        matches = [v for k, v in found.value if k.tag == _YAML_STR_TAG and k.value == parts[depth]]
+        if not matches:
+            break
+        found, depth = matches[-1], depth + 1
+    where = ".".join(parts[:depth]) or "the top level"
+    if depth < len(parts) and found is not None and not _is_plain_yaml_map(found):
+        if found.tag == _YAML_NULL_TAG:
+            raise ValueError(f"{where} is empty")
+        is_list = isinstance(found, yaml.SequenceNode)
+        raise ValueError(f"{where} is {'a list' if is_list else 'not a mapping'}")
+
+    expected = copy.deepcopy(data)
+    _set_nested_value(expected, key, value)
+    new_value = _get_nested_value(expected, key)
+
+    if found is not None and depth == len(parts):
+        # The key exists: replace the text of its value.
+        start, end = found.start_mark.index, _yaml_content_end(raw, found)
+        block = isinstance(found, (yaml.MappingNode, yaml.SequenceNode)) and not found.flow_style
+        # Comments on a block collection's last line, or indented under it, would end up
+        # beside the new value's last item, so for those the check runs that far.
+        check_end = _yaml_block_end(raw, found, int(found.start_mark.column) - 1) if block else end
+        if _yaml_has_comment(raw, start, check_end):
+            raise ValueError(f"{key} holds comments that the new value would drop or misplace")
+        if block and isinstance(new_value, (dict, list)) and new_value:
+            # A block collection stays one, aligned where the old one started.
+            dumped = yaml.safe_dump(
+                new_value, default_flow_style=False, sort_keys=False, width=sys.maxsize
+            )
+            pad = "\n" + " " * int(found.start_mark.column)
+            text = pad.join(dumped.rstrip("\n").split("\n"))
+        else:
+            text = _yaml_inline(new_value)
+        if start and raw[start - 1] not in " \t\r\n":
+            text = " " + text  # an empty value starts right after its colon
+    elif found is None:
+        # Empty or comment-only file: append the keys at the end.
+        start = end = len(raw)
+        lead = "" if not raw or raw.endswith("\n") else "\n"
+        text = lead + _yaml_new_keys(parts, 0, new_value) + "\n"
+    else:
+        # Insert the missing keys under the deepest existing mapping.
+        if found.flow_style:
+            raise ValueError(f"{where} is a flow mapping")
+        indent = found.value[0][0].start_mark.column
+        start = end = _yaml_block_end(raw, found, indent)
+        text = "\n" + _yaml_new_keys(parts[depth:], indent, new_value)
+
+    newline = "\r\n" if "\r\n" in raw else "\n" if "\n" in raw else os.linesep
+    new_raw = raw[:start] + text.replace("\n", newline) + raw[end:]
+    try:
+        reparsed = yaml.safe_load(new_raw)
+    except yaml.YAMLError as e:
+        # The edit produced invalid YAML; the user's file itself is fine.
+        raise ValueError("the change could not be made in place") from e
+    # Compared as canonical YAML rather than with ==, which ignores key order, equates
+    # True with 1, and never equates two separately created NaNs.
+    if yaml.safe_dump(reparsed, sort_keys=False) != yaml.safe_dump(expected, sort_keys=False):
+        raise ValueError("the change could not be made without altering other values")
+    return new_raw
+
+
+def _write_config_atomically(path: Path, text: str) -> None:
+    """Replace ``path`` with ``text`` through a sibling temp file, so a failed write
+    leaves the old file whole.
+
+    A symlinked config is resolved first so the link survives, and the old file's mode
+    carries over (a config holding API keys may be 0600).
+    """
+    target = path.resolve()
+    # A rename would replace a read-only file that a plain write could not open.
+    if target.exists() and not os.access(target, os.W_OK):
+        raise PermissionError("the file is read-only")
+    fd, tmp = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        if target.exists():
+            shutil.copymode(target, tmp)
+        os.replace(tmp, target)
+    except BaseException:
+        with contextlib.suppress(OSError):  # never let cleanup hide the real error
+            os.unlink(tmp)
+        raise
 
 
 def _render_result_markdown(
@@ -1895,11 +2106,16 @@ defaults:
             raise typer.Exit(1)
 
         config_dir.mkdir(parents=True, exist_ok=True)
-        config_data = _load_config()
-        _set_nested_value(config_data, set_key, set_value)
-
-        with open(config_file, "w") as f:
-            yaml.safe_dump(config_data, f, default_flow_style=False, sort_keys=False)
+        try:
+            # Raw bytes, not _load_config(): no ${VAR} expansion, a broken file is an
+            # error rather than {}, and the file's own line endings survive.
+            raw = config_file.read_bytes().decode("utf-8") if config_file.exists() else ""
+            new_raw = _set_config_value_in_text(raw, set_key, set_value)
+            _write_config_atomically(config_file, new_raw)
+        except (OSError, ValueError, yaml.YAMLError) as e:
+            console.print(f"[red]Error:[/red] {config_file} was not changed: {e}")
+            console.print("Edit it directly with: council config --edit")
+            raise typer.Exit(1)
 
         console.print(f"[green]Set {set_key} = {set_value}[/green]")
         return
