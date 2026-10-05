@@ -601,7 +601,8 @@ class TestCLIConfig:
         assert config_file.exists()
         contents = config_file.read_text()
         assert "api_key: ${OPENROUTER_API_KEY}" in contents
-        assert "default_model: anthropic/claude-opus-5" in contents
+        # Exact line: a substring check would also accept a longer id such as "...-5.55".
+        assert "    default_model: anthropic/claude-opus-5.5" in contents.splitlines()
 
     def test_load_provider_configs_expands_env_api_keys(self, tmp_path, monkeypatch):
         """Provider configs should expand ${ENV_VAR} placeholders before constructor wiring."""

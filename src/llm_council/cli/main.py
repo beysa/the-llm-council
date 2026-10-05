@@ -276,13 +276,13 @@ def _load_provider_configs() -> dict[str, dict[str, Any]]:
 
         providers:
           - name: openai
-            default_model: gpt-5.4
+            default_model: gpt-6.1-sol
           - name: gemini
             default_model: gemini-3.1-pro-preview
 
     Returns::
 
-        {"openai": {"api_key": "sk-...", "default_model": "gpt-5.4"},
+        {"openai": {"api_key": "sk-...", "default_model": "gpt-6.1-sol"},
          "gemini": {"api_key": "AIza...", "default_model": "gemini-3.1-pro-preview"}}
     """
     config = _load_config()
@@ -314,8 +314,8 @@ def _load_fallback_providers() -> dict[str, str]:
     Reads a top-level ``fallbacks`` mapping of provider -> replacement provider::
 
         fallbacks:
-          claude: anthropic/claude-opus-5
-          codex: openai/gpt-5.6-sol
+          claude: anthropic/claude-opus-5.5
+          codex: openai/gpt-6.1-sol
           sakana: sakana/fugu-ultra
 
     A replacement containing ``/`` is instantiated as an OpenRouter virtual
@@ -2086,7 +2086,7 @@ def config(
 providers:
   - name: openrouter
     api_key: ${OPENROUTER_API_KEY}
-    default_model: anthropic/claude-opus-5
+    default_model: anthropic/claude-opus-5.5
 
 # Default settings for 'council run' command
 defaults:

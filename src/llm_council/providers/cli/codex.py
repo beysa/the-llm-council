@@ -43,7 +43,7 @@ from llm_council.providers.base import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "gpt-5.4"
+DEFAULT_MODEL = "gpt-6.1-sol"
 # SECURITY: Least-privilege defaults - read-only sandbox, no auto-approve
 # Override via CODEX_CLI_FLAGS env var or default_flags param for agentic mode
 DEFAULT_FLAGS = "--sandbox read-only --skip-git-repo-check"

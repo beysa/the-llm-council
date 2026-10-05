@@ -36,7 +36,7 @@ from llm_council.providers.cli._subprocess import terminate_process_tree
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "sonnet"
+DEFAULT_MODEL = "claude-opus-5-5"
 
 # Minimal environment allowlist for subprocess
 _ENV_ALLOWLIST = {

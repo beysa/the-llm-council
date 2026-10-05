@@ -21,7 +21,7 @@ from llm_council.providers.base import (
     ProviderCapabilities,
 )
 
-DEFAULT_MODEL = "claude-opus-4-6"
+DEFAULT_MODEL = "claude-opus-5-5"
 ENV_MODEL = "ANTHROPIC_MODEL"
 
 # Beta header required for structured outputs
@@ -30,13 +30,16 @@ STRUCTURED_OUTPUTS_BETA = "structured-outputs-2025-11-13"
 
 # Model prefixes that support structured output with output_format
 # Requires beta header: anthropic-beta: structured-outputs-2025-11-13
-# Claude 4.x family (December 2025+) supports structured outputs
+# Claude 4.x and 5.x families support structured outputs
 # Claude 3.x family does NOT support structured outputs
 STRUCTURED_OUTPUT_MODEL_PREFIXES = (
     "claude-opus-4",  # Claude Opus 4.x series
     "claude-sonnet-4",  # Claude Sonnet 4.x series
     "claude-haiku-4",  # Claude Haiku 4.x series
     "claude-4",  # Alternative naming pattern
+    "claude-opus-5",  # Claude Opus 5.x series
+    "claude-sonnet-5",  # Claude Sonnet 5.x series
+    "claude-fable-5",  # Claude Fable 5.x series
 )
 
 # Explicit model names known to support structured output
@@ -335,7 +338,7 @@ class AnthropicProvider(ProviderAdapter):
     def _model_supports_structured_output(self, model: str) -> bool:
         """Check if a specific model supports structured output.
 
-        Structured outputs are supported on Claude 4.x family models:
+        Structured outputs are supported on Claude 4.x and 5.x family models:
         - Claude Opus 4.x (claude-opus-4-6, claude-opus-4-5, claude-opus-4-1, etc.)
         - Claude Sonnet 4.x (claude-sonnet-4-6, claude-sonnet-4-5, etc.)
         - Claude Haiku 4.x (claude-haiku-4-5, etc.)
@@ -364,7 +367,7 @@ class AnthropicProvider(ProviderAdapter):
         if base_model in STRUCTURED_OUTPUT_MODELS:
             return True
 
-        # Check if model starts with any supported prefix (Claude 4.x family)
+        # Check if model starts with any supported prefix (Claude 4.x / 5.x families)
         return any(model.startswith(prefix) for prefix in STRUCTURED_OUTPUT_MODEL_PREFIXES)
 
     def _cache_control_for_request(self, request: GenerateRequest) -> dict[str, str] | None:

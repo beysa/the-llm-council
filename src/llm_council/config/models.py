@@ -13,9 +13,9 @@ Environment Variables:
 
     Model pack overrides (optional):
         COUNCIL_MODEL_FAST: Fast model for quick tasks (default: claude-haiku-4.5)
-        COUNCIL_MODEL_REASONING: Deep reasoning model (default: claude-opus-5)
-        COUNCIL_MODEL_CODE: Code specialist model (default: gpt-5.4)
-        COUNCIL_MODEL_CRITIC: Adversarial critic model (default: claude-sonnet-5)
+        COUNCIL_MODEL_REASONING: Deep reasoning model (default: claude-opus-5.5)
+        COUNCIL_MODEL_CODE: Code specialist model (default: gpt-6.1-sol)
+        COUNCIL_MODEL_CRITIC: Adversarial critic model (default: claude-sonnet-5.5)
         COUNCIL_MODEL_GROUNDED: Grounded/RAG model (default: gemini-3.1-pro-preview)
 """
 
@@ -82,25 +82,26 @@ def resolve_model_pack(yaml_value: str) -> ModelPack:
 
 
 # Default models for each pack (OpenRouter format), checked against OpenRouter's catalogue
-# (https://openrouter.ai/api/v1/models) on 2026-09-21. Two changes in one: the old dashed
+# (https://openrouter.ai/api/v1/models) on 2026-09-21, bumped 2026-10-05 to
+# opus-5.5 / sonnet-5.5 / gpt-6.1-sol (all three listed there). Two changes in one: the old dashed
 # ids ("anthropic/claude-opus-4-6") are the Anthropic API's own form and are not listed
 # there at all; and Opus/Sonnet move to the 5 family (listed; opus-5 costs what opus-4.6
 # did, sonnet-5 less than sonnet-4.6). FAST stays on claude-haiku-4.5, the newest Haiku
 # OpenRouter lists.
 DEFAULT_MODEL_PACKS: dict[ModelPack, str] = {
     ModelPack.FAST: "anthropic/claude-haiku-4.5",
-    ModelPack.REASONING: "anthropic/claude-opus-5",
-    ModelPack.CODE: "openai/gpt-5.4",
-    ModelPack.CODE_COMPLEX: "anthropic/claude-opus-5",  # Use Opus for complex refactors
-    ModelPack.CRITIC: "anthropic/claude-sonnet-5",
+    ModelPack.REASONING: "anthropic/claude-opus-5.5",
+    ModelPack.CODE: "openai/gpt-6.1-sol",
+    ModelPack.CODE_COMPLEX: "anthropic/claude-opus-5.5",  # Use Opus for complex refactors
+    ModelPack.CRITIC: "anthropic/claude-sonnet-5.5",
     ModelPack.GROUNDED: "google/gemini-3.1-pro-preview",  # Gemini for grounded/search tasks
-    ModelPack.DEFAULT: "anthropic/claude-opus-5",
+    ModelPack.DEFAULT: "anthropic/claude-opus-5.5",
 }
 
-# Default council models for multi-model runs - September 2026
+# Default council models for multi-model runs - October 2026
 DEFAULT_COUNCIL_MODELS: list[str] = [
-    "anthropic/claude-opus-5",
-    "openai/gpt-5.4",
+    "anthropic/claude-opus-5.5",
+    "openai/gpt-6.1-sol",
     "google/gemini-3.1-pro-preview",
 ]
 

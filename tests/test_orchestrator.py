@@ -1198,7 +1198,8 @@ class TestOrchestratorRuntimeTruthfulness:
 
         assert orch._resolved_model_pack == "code"
         assert orch._execution_plan is not None
-        assert orch._execution_plan["model_overrides"]["openai"] == "gpt-5.4"
+        # The CODE pack default ("openai/gpt-6.1-sol") without its OpenRouter prefix.
+        assert orch._execution_plan["model_overrides"]["openai"] == "gpt-6.1-sol"
 
     def test_prepare_run_applies_single_model_override_to_openrouter(self):
         """A single --models entry should override the active OpenRouter provider."""

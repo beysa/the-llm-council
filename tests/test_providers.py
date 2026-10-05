@@ -861,6 +861,42 @@ class TestOpenAIProviderRequestParams:
         assert captured_kwargs["max_completion_tokens"] == 100
 
     @pytest.mark.asyncio
+    async def test_default_model_uses_max_completion_tokens(self):
+        """The default model must send max_completion_tokens, as the GPT-5.x default did.
+
+        The token parameter is chosen by model-name prefix, so a new default family that
+        no prefix covers would silently fall back to the legacy max_tokens parameter.
+        """
+        provider = OpenAIProvider(api_key="test-key")
+
+        captured_kwargs: dict[str, object] = {}
+
+        async def create(**kwargs):
+            captured_kwargs.update(kwargs)
+            message = MagicMock(content='{"ok": true}', tool_calls=None)
+            choice = MagicMock(message=message, finish_reason="stop")
+            usage = MagicMock(prompt_tokens=1, completion_tokens=1, total_tokens=2)
+            return MagicMock(choices=[choice], usage=usage, model=OPENAI_DEFAULT_MODEL)
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(side_effect=create)
+        provider._client = mock_client
+
+        request = GenerateRequest(messages=[Message(role="user", content="test")], max_tokens=100)
+
+        await provider.generate(request)
+
+        assert captured_kwargs["model"] == OPENAI_DEFAULT_MODEL
+        assert captured_kwargs["max_completion_tokens"] == 100
+        assert "max_tokens" not in captured_kwargs
+
+    def test_default_model_supports_structured_output(self):
+        """The default model must keep json_schema output, which is gated by model name."""
+        provider = OpenAIProvider(api_key="test-key")
+
+        assert provider._model_supports_structured_output(OPENAI_DEFAULT_MODEL)
+
+    @pytest.mark.asyncio
     async def test_request_timeout_is_forwarded_to_openai_sdk(self):
         """Per-request timeout should be forwarded to the OpenAI SDK call."""
         provider = OpenAIProvider(api_key="test-key")
@@ -1295,6 +1331,12 @@ class TestVertexPromptCaching:
 
 class TestAnthropicProviderEnvModel:
     """Tests for ANTHROPIC_MODEL env var fallback in AnthropicProvider."""
+
+    def test_default_model_supports_structured_output(self):
+        """The default model must keep structured output, which is gated by model name."""
+        provider = AnthropicProvider(api_key="test-key")
+
+        assert provider._model_supports_structured_output(ANTHROPIC_DEFAULT_MODEL)
 
     def test_default_model_used_when_no_arg_no_env(self, monkeypatch):
         """DEFAULT_MODEL is used when neither arg nor env var is set."""
@@ -1851,9 +1893,12 @@ class TestCLIProviderTimeouts:
         assert mock_exec.await_args.kwargs["start_new_session"] is True
 
     def test_codex_cli_defaults_to_chatgpt_compatible_model(self):
-        """Codex CLI should default to a model that works with ChatGPT auth."""
+        """Codex CLI should default to a model that works with ChatGPT auth.
+
+        gpt-6.1-sol needs codex-cli >= 0.160.1; 0.154.0 rejected it for ChatGPT accounts.
+        """
         provider = CodexCLIProvider(cli_path="/usr/local/bin/codex")
-        assert provider._default_model == "gpt-5.4"
+        assert provider._default_model == "gpt-6.1-sol"
         assert provider.capabilities.structured_output is True
 
     @pytest.mark.asyncio

@@ -21,7 +21,7 @@ from llm_council.providers.base import (
     ProviderCapabilities,
 )
 
-DEFAULT_MODEL = "gpt-5.4"
+DEFAULT_MODEL = "gpt-6.1-sol"
 ENV_MODEL = "OPENAI_MODEL"
 ENV_TIMEOUT_SECONDS = "OPENAI_TIMEOUT_SECONDS"
 ENV_MAX_RETRIES = "OPENAI_MAX_RETRIES"
@@ -69,6 +69,7 @@ STRUCTURED_OUTPUT_MODELS = frozenset(
 
 # Model prefixes for easier matching (handles dated versions)
 STRUCTURED_OUTPUT_MODEL_PREFIXES = (
+    "gpt-6",  # All GPT-6.x models
     "gpt-5",  # All GPT-5.x models
     "gpt-4o",  # All GPT-4o variants
     "gpt-4.1",  # All GPT-4.1 variants
@@ -110,8 +111,8 @@ REASONING_MODELS = frozenset(
 REASONING_MODEL_PREFIXES = ("o1", "o3", "o4")
 
 # Models that use max_completion_tokens instead of max_tokens
-# GPT-5.x and o-series use the new parameter
-MAX_COMPLETION_TOKENS_PREFIXES = ("gpt-5", "o1", "o3", "o4")
+# GPT-6.x, GPT-5.x and o-series use the new parameter
+MAX_COMPLETION_TOKENS_PREFIXES = ("gpt-6", "gpt-5", "o1", "o3", "o4")
 
 
 def _make_schema_strict_compatible(schema: dict[str, Any]) -> dict[str, Any]:
@@ -289,7 +290,7 @@ class OpenAIProvider(ProviderAdapter):
 
         if request.max_tokens is not None:
             model = request.model or self._default_model
-            # GPT-5.x and o-series use max_completion_tokens instead of max_tokens
+            # GPT-6.x, GPT-5.x and o-series use max_completion_tokens instead of max_tokens
             if any(model.startswith(p) for p in MAX_COMPLETION_TOKENS_PREFIXES):
                 kwargs["max_completion_tokens"] = request.max_tokens
             else:
@@ -424,7 +425,7 @@ class OpenAIProvider(ProviderAdapter):
         """Check if a specific model supports structured output with JSON schema.
 
         Supported models include:
-        - GPT-5.x family (gpt-5.1, gpt-5.2, gpt-5.1-codex, gpt-5.2-codex)
+        - GPT-6.x / GPT-5.x families (gpt-6.1-sol, gpt-5.1, gpt-5.2, gpt-5.1-codex, ...)
         - GPT-4o family (gpt-4o, gpt-4o-mini)
         - GPT-4.1 family (gpt-4.1, gpt-4.1-mini, gpt-4.1-nano)
         - o-series reasoning models (o1, o3-mini, o4-mini)
