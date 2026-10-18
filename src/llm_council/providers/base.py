@@ -26,6 +26,7 @@ class ErrorType(str, Enum):
     AUTH = "auth"  # API key invalid or missing
     MODEL_UNAVAILABLE = "model_unavailable"
     NETWORK = "network"
+    EMPTY_RESPONSE = "empty_response"
     UNKNOWN = "unknown"
 
 
@@ -35,6 +36,7 @@ NON_RETRYABLE_ERRORS = frozenset(
         ErrorType.BILLING,
         ErrorType.AUTH,
         ErrorType.CLI_NOT_FOUND,
+        ErrorType.EMPTY_RESPONSE,
     }
 )
 
@@ -42,10 +44,11 @@ NON_RETRYABLE_ERRORS = frozenset(
 _BILLING_PATTERNS = (
     "insufficient_quota",
     "billing",
-    "credit",
     "payment",
     "exceeded your current quota",
     "insufficient credits",
+    "requires more credits",
+    "credit balance is too low",
     "account has been suspended",
     "payment required",
     "plan does not include",
@@ -66,6 +69,7 @@ _AUTH_PATTERNS = (
     "unauthorized",
     "authentication",
     "api key not found",
+    "not logged in",
     "401",
 )
 
@@ -73,8 +77,6 @@ _MODEL_UNAVAILABLE_PATTERNS = (
     "model not found",
     "model_not_found",
     "does not exist",
-    "model is currently overloaded",
-    "capacity",
     "model is not supported when using codex with a chatgpt account",
     "not supported when using codex with a chatgpt account",
     "unsupported model",
@@ -113,6 +115,7 @@ _SERVER_ERROR_PATTERNS = (
     "internal server error",
     "bad gateway",
     "service unavailable",
+    "selected model is at capacity",
     "server error",
     "overloaded_error",
     "overloaded",
@@ -150,6 +153,9 @@ def classify_error(error_text: str, return_code: int = -1) -> ErrorType:
         return ErrorType.NONE
 
     error_lower = error_text.lower() if error_text else ""
+
+    if "empty_response:" in error_lower:
+        return ErrorType.EMPTY_RESPONSE
 
     # Check billing errors first (most critical, don't waste money retrying)
     for pattern in _BILLING_PATTERNS:
@@ -466,6 +472,35 @@ class GenerateResponse(BaseModel):
 GenerateResult = GenerateResponse | AsyncIterator[GenerateResponse]
 
 
+def ensure_text_response(response: GenerateResponse, *, provider: str, phase: str) -> None:
+    """Reject empty generation without disclosing raw responses or tool arguments."""
+    if (response.text or "").strip():
+        return
+    finish_reason = (response.finish_reason or "unknown").lower()
+    if finish_reason not in {
+        "unknown",
+        "stop",
+        "length",
+        "max_tokens",
+        "end_turn",
+        "tool_use",
+        "tool_calls",
+        "safety",
+        "recitation",
+        "content_filter",
+        "error",
+        "malformed_function_call",
+        "unexpected_tool_call",
+        "other",
+    }:
+        finish_reason = "unrecognized"
+    raise RuntimeError(
+        f"empty_response: {provider} {phase} returned no usable text; "
+        f"finish_reason={finish_reason}; "
+        f"tool_calls_present={str(bool(response.tool_calls)).lower()}"
+    )
+
+
 class DoctorResult(BaseModel):
     """Health check result for providers."""
 
@@ -500,6 +535,17 @@ class ProviderAdapter(ABC):
 
     name: ClassVar[str]
     capabilities: ClassVar[ProviderCapabilities]
+
+    def resolve_model(self, requested: str | None) -> str | None:
+        """Resolve the instantiated adapter's model without I/O or changing defaults.
+
+        Built-ins keep their selected default in ``_default_model``. Other adapters
+        may override this hook; an unknown default remains unknown.
+        """
+        if requested:
+            return requested
+        default = getattr(self, "_default_model", None)
+        return default if isinstance(default, str) else None
 
     @abstractmethod
     async def generate(self, request: GenerateRequest) -> GenerateResult:

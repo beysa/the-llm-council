@@ -20,11 +20,16 @@ import json
 import locale
 import logging
 import os
+import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+from collections.abc import Awaitable, Callable
+from functools import wraps
 from pathlib import Path
+from types import FrameType
 from typing import TYPE_CHECKING, Annotated, Any
 
 import click
@@ -34,8 +39,10 @@ import yaml
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 from llm_council import __version__
+from llm_council.engine.orchestrator import runtime_identity
 from llm_council.eval_import import import_github_pr_review
 from llm_council.evaluation import (
     EvalComparisonReport,
@@ -50,6 +57,7 @@ from llm_council.providers.concurrency import provider_call_slot
 from llm_council.storage.artifacts import ArtifactStore
 
 if TYPE_CHECKING:
+    from llm_council.engine.orchestrator import CouncilResult
     from llm_council.protocol.types import CouncilConfig
 
 # Global state for CLI context
@@ -222,7 +230,7 @@ def _get_config_file() -> Path:
                 # Path is outside allowed directories - only allow if it exists
                 # and is a regular file (not a device, symlink to sensitive file, etc.)
                 if not custom_path.exists():
-                    raise typer.Exit(1)
+                    raise FileNotFoundError(f"Config file not found: {custom_path}")
         return custom_path
     return Path.home() / ".config" / "llm-council" / "config.yaml"
 
@@ -585,6 +593,113 @@ def _write_config_atomically(path: Path, text: str) -> None:
         raise
 
 
+def _execution_status(result: Any) -> str:
+    status = getattr(result, "execution_status", None)
+    if status in ("completed", "degraded", "failed", "cancelled"):
+        return str(status)
+    return "completed" if getattr(result, "success", False) else "failed"
+
+
+def _safe_diagnostic(value: Any) -> Any:
+    """Redact credential fields and known secret values, not task/output content."""
+    credential_name = (
+        r"(?:api[_-]?keys?|secrets?|passwords?|credentials?|authorization|cookies?|"
+        r"(?:secret[_-]?access|private)[_-]?keys?|"
+        r"(?:access|refresh|auth|bearer|id|session)[_-]?tokens?)"
+    )
+    secret_key = re.compile(
+        rf"(?:^|[_-]){credential_name}$|^token$",
+        re.IGNORECASE,
+    )
+    secrets = [
+        v
+        for k, v in os.environ.items()
+        if (secret_key.search(k) or k.upper().endswith("_TOKEN")) and len(v) >= 4
+    ]
+
+    def clean(item: Any) -> Any:
+        if isinstance(item, dict):
+            return {
+                key: "[REDACTED]" if secret_key.search(str(key)) else clean(val)
+                for key, val in item.items()
+            }
+        if isinstance(item, (list, tuple)):
+            return [clean(val) for val in item]
+        if isinstance(item, str):
+            for secret in sorted(secrets, key=len, reverse=True):
+                item = item.replace(secret, "[REDACTED]")
+            item = re.sub(r"(?i)\b(Bearer|Basic)\s+[^\s,;\"']+", r"\1 [REDACTED]", item)
+            item = re.sub(
+                rf"(?i)((?<![\w-])(?:(?:[\w-]+[_-])?{credential_name}|token)"
+                r"\b[\"']?\s*[:=]\s*)"
+                r"(?:\"[^\"]*\"|'[^']*'|(?!(?:Bearer|Basic)\b)[^\s,;\"']+)",
+                r"\1[REDACTED]",
+                item,
+            )
+            return item
+        return item
+
+    return clean(value)
+
+
+def _prepare_report_result(result: Any) -> Any:
+    # Do not revalidate/reclassify engine facts merely by attaching CLI metadata.
+    prepared = copy.copy(result)
+    for key in (
+        "error",
+        "validation_errors",
+        "provider_errors",
+        "degradation_report",
+        "health_report",
+        "execution_plan",
+        "routing_execution_plan",
+    ):
+        setattr(prepared, key, _safe_diagnostic(getattr(result, key, None)))
+    prepared.execution_plan = {
+        **(prepared.execution_plan or {}),
+        "runtime_identity": runtime_identity(),
+    }
+    return prepared
+
+
+def _result_diagnostics(result: Any) -> dict[str, Any]:
+    diagnostics = {}
+    for key in ("error", "validation_errors", "provider_errors", "degradation_report"):
+        value = getattr(result, key, None)
+        if value:
+            diagnostics[key] = value
+    plan = getattr(result, "execution_plan", None) or {}
+    for key in (
+        "context_preparation",
+        "persistence",
+        "warnings",
+        "degraded_output",
+        "provider_auto_fallback",
+        "pending_capabilities",
+        "cleanup_incomplete",
+    ):
+        if plan.get(key):
+            diagnostics[key] = plan[key]
+    return {key: _safe_diagnostic(value) for key, value in diagnostics.items()}
+
+
+def _parse_models(models: str | None, providers: list[str]) -> list[str] | None:
+    from llm_council.providers.registry import resolve_provider_name
+
+    model_list = [m.strip() for m in models.split(",") if m.strip()] if models else None
+    known_providers = {"openai", "openrouter", "vertex-ai", "gemini", "codex", "claude"}
+    known_providers.update(resolve_provider_name(p) for p in providers)
+    for model in model_list or []:
+        prefix, separator, _ = model.partition(":")
+        if separator and prefix and resolve_provider_name(prefix) in known_providers:
+            raise ValueError(
+                "--models accepts positional literal model IDs, not provider:model mappings. "
+                "Remove the provider prefix; order models to match --providers "
+                "(or pass multiple OpenRouter model IDs for a single OpenRouter provider)."
+            )
+    return model_list
+
+
 def _render_result_markdown(
     result: Any,
     *,
@@ -600,11 +715,11 @@ def _render_result_markdown(
     """
     lines: list[str] = []
     success = bool(getattr(result, "success", False))
-    status = "SUCCESS" if success else "FAILED"
+    status = _execution_status(result).upper()
     lines.append(f"# Council Result: {status}")
     lines.append("")
 
-    if success:
+    if success or getattr(result, "output", None) is not None:
         output = getattr(result, "output", None)
         lines.append("## Output")
         lines.append("")
@@ -624,7 +739,7 @@ def _render_result_markdown(
             errors = [top_error, *errors]
         if errors:
             for err in errors:
-                lines.append(f"- {err}")
+                lines.append(f"- {_safe_diagnostic(err)}")
         else:
             lines.append("- Unknown error")
         lines.append("")
@@ -639,7 +754,7 @@ def _render_result_markdown(
             lines.append(f"- Provider: {provider}")
         reason = getattr(degraded, "reason", None)
         if reason:
-            lines.append(f"- Reason: {reason}")
+            lines.append(f"- Reason: {_safe_diagnostic(reason)}")
         text = getattr(degraded, "text", None)
         if isinstance(text, str) and text.strip():
             lines.append("- Schema-valid: no (raw provider text, not validated output)")
@@ -648,6 +763,18 @@ def _render_result_markdown(
             lines.append(text.strip())
             lines.append("```")
         lines.append("")
+    diagnostics = _result_diagnostics(result)
+    if diagnostics:
+        lines.extend(
+            [
+                "## Execution Diagnostics",
+                "",
+                "```json",
+                json.dumps(diagnostics, indent=2, default=str),
+                "```",
+                "",
+            ]
+        )
 
     critique = getattr(result, "critique", None)
     if critique:
@@ -692,7 +819,172 @@ def _render_result_markdown(
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _validate_output_destination(path: Path) -> None:
+    """Probe the destination without changing an existing invocation's result."""
+    if path.exists() and not path.is_file():
+        raise ValueError(f"Output is not a regular file: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}."):
+        pass
+
+
+def _write_result(path: Path, payload: str) -> None:
+    """Atomically publish the already-rendered result without changing its format."""
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            stream.write(payload)
+            if not payload.endswith("\n"):
+                stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _execute_run(run: Callable[[], Awaitable[CouncilResult]]) -> CouncilResult:
+    """Own CLI signals and a finite cleanup window, not library-global handlers."""
+    from llm_council.engine.orchestrator import CouncilResult
+
+    loop = asyncio.new_event_loop()
+    received_signal = 0
+    handlers: dict[int, Callable[[int, FrameType | None], Any] | int | None] = {}
+    cancellation_result: CouncilResult | None = None
+
+    async def capture_result() -> CouncilResult:
+        nonlocal cancellation_result
+        try:
+            return await run()
+        except asyncio.CancelledError as exc:
+            # Python 3.10 can replace CancelledError at a Task boundary.
+            cancellation_result = getattr(exc, "result", None)
+            raise
+
+    async def supervise() -> CouncilResult:
+        nonlocal received_signal
+        interrupted: asyncio.Future[int] = loop.create_future()
+        active = loop.create_task(capture_result())
+
+        def handle_signal(signum: int, _frame: FrameType | None) -> None:
+            nonlocal received_signal
+            if received_signal:
+                os.write(2, b"Second signal: cleanup incomplete.\n")
+                os._exit(128 + signum)
+            received_signal = signum
+            loop.call_soon_threadsafe(active.cancel)
+            loop.call_soon_threadsafe(interrupted.set_result, signum)
+
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, handle_signal)
+        waiters: tuple[asyncio.Future[Any], ...] = (active, interrupted)
+        await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+        if not received_signal:
+            interrupted.cancel()
+            return active.result()
+
+        done, _ = await asyncio.wait({active}, timeout=5.0)
+        result = cancellation_result or CouncilResult(
+            success=False,
+            execution_status="cancelled",
+            error="Council run cancelled.",
+        )
+        if done:
+            try:
+                active.result()
+            except (asyncio.CancelledError, Exception):
+                pass
+        else:
+            result.error = "Council run cancelled; cleanup incomplete after 5 seconds."
+        result.execution_status = "cancelled"
+        result.success = False
+        return result.model_copy(update={"signal_number": received_signal})
+
+    try:
+        return loop.run_until_complete(supervise())
+    finally:
+        for signum, handler in handlers.items():
+            signal.signal(signum, handler)
+        # Unlike asyncio.run(), do not wait without a deadline a second time.
+        for pending in asyncio.all_tasks(loop):
+            pending.cancel()
+        loop.close()
+
+
+def _run_contract(command: Callable[..., None]) -> Callable[..., None]:
+    """Normalize post-parse failures without replacing Typer's usage errors."""
+
+    @wraps(command)
+    def invoke(*args: Any, **kwargs: Any) -> None:
+        from llm_council.engine.orchestrator import CouncilResult
+
+        output_file = kwargs.get("output_file")
+        output_json = kwargs.get("output_json", False)
+        markdown_output = False
+        destination_valid = False
+        try:
+            output_format = (kwargs.get("output_format") or "").strip().lower()
+            markdown_output = output_format in {"md", "markdown"}
+            if output_format == "json":
+                output_json = True
+            if output_file:
+                _validate_output_destination(output_file)
+                destination_valid = True
+            if not output_format and not output_json:
+                default_format = (
+                    (_load_config_defaults().get("output_format") or "").strip().lower()
+                )
+                output_json = default_format == "json"
+                markdown_output = default_format in {"md", "markdown"}
+            kwargs["output_json"] = output_json
+            command(*args, **kwargs)
+        except typer.Exit:
+            raise
+        except BrokenPipeError:
+            # Prevent Python's shutdown flush from changing exit 1 into exit 120.
+            try:
+                with open(os.devnull, "w") as sink:
+                    os.dup2(sink.fileno(), sys.stdout.fileno())
+            except (OSError, ValueError):
+                pass
+            raise typer.Exit(1)
+        except Exception as exc:
+            result = _prepare_report_result(CouncilResult(success=False, error=str(exc)))
+            payload = (
+                _render_result_markdown(result)
+                if markdown_output
+                else json.dumps(result.model_dump(), indent=2, default=str)
+            )
+            if output_file:
+                if destination_valid:
+                    try:
+                        _write_result(output_file, payload)
+                    except OSError as write_error:
+                        _get_console(stderr=True).print(
+                            f"Error writing result: {_safe_diagnostic(str(write_error))}",
+                            markup=False,
+                        )
+                _get_console(stderr=True).print(f"Error: {result.error}", markup=False)
+            elif output_json or markdown_output:
+                print(payload, flush=True)
+            else:
+                _get_console(stderr=True).print(f"Error: {result.error}", markup=False)
+            raise typer.Exit(1)
+
+    return invoke
+
+
 @app.command()
+@_run_contract
 def run(
     subagent: Annotated[str, typer.Argument(help="Subagent type (drafter, critic, planner, etc.)")],
     task: Annotated[str | None, typer.Argument(help="Task description")] = None,
@@ -730,7 +1022,9 @@ def run(
     ] = False,
     timeout: Annotated[
         int | None,
-        typer.Option("--timeout", "-t", help="Request timeout in seconds"),
+        typer.Option(
+            "--timeout", "-t", help="Per-attempt timeout in seconds (10-3600; default 120)"
+        ),
     ] = None,
     temperature: Annotated[
         float | None,
@@ -816,29 +1110,25 @@ def run(
         else:
             input_path = Path(input_file)
             if not input_path.exists():
-                console.print(f"[red]Error:[/red] Input file not found: {input_file}")
-                raise typer.Exit(1)
+                raise ValueError(f"Input file not found: {input_file}")
             task_text = input_path.read_text().strip()
 
     if not task_text:
-        console.print("[red]Error:[/red] No task provided. Use positional argument or --input")
-        raise typer.Exit(1)
+        raise ValueError("No task provided. Use positional argument or --input")
 
     # Input validation: limit task size to prevent resource exhaustion
-    max_task_length = 100_000  # 100KB limit
+    max_task_length = 100_000  # Character limit, not UTF-8 bytes.
     if len(task_text) > max_task_length:
-        console.print(
-            f"[red]Error:[/red] Task too long ({len(task_text):,} chars). "
-            f"Maximum is {max_task_length:,} characters."
+        raise ValueError(
+            f"Task too long ({len(task_text):,} chars). Maximum is {max_task_length:,} characters."
         )
-        raise typer.Exit(1)
 
     # Read --files and merge into context
     context_metadata: dict[str, Any] = {}
     if files:
         file_context_parts: list[str] = []
-        max_total_bytes = 200_000  # 200KB total cap
-        max_per_file = 50_000  # 50KB per file
+        max_total_bytes = 200_000  # Character caps, not UTF-8 byte caps.
+        max_per_file = 50_000
         total_bytes = 0
         file_entries: list[dict[str, Any]] = []
         warnings: list[str] = []
@@ -849,33 +1139,20 @@ def run(
                 continue
             p = Path(fpath)
             if not p.exists():
-                warning = f"File not found: {fpath}"
-                warnings.append(warning)
-                _warn(f"[yellow]Warning:[/yellow] {warning}")
-                file_entries.append({"path": fpath, "status": "missing"})
-                continue
+                raise ValueError(f"File not found: {fpath}")
             content = p.read_text(encoding="utf-8", errors="replace")
             original_chars = len(content)
             retained_chars = original_chars
             truncated = False
             if len(content) > max_per_file:
-                content = content[:max_per_file] + f"\n... [truncated at {max_per_file // 1000}KB]"
+                content = content[:max_per_file]
                 retained_chars = len(content)
                 truncated = True
-                warnings.append(f"Truncated {fpath} to {max_per_file} chars.")
-            if total_bytes + len(content) > max_total_bytes:
-                warning = f"Skipping {fpath} (200KB total limit)"
+                warning = f"Truncated {fpath} to {max_per_file} chars."
                 warnings.append(warning)
                 _warn(f"[yellow]Warning:[/yellow] {warning}")
-                file_entries.append(
-                    {
-                        "path": fpath,
-                        "status": "skipped_total_limit",
-                        "original_chars": original_chars,
-                        "retained_chars": 0,
-                    }
-                )
-                continue
+            if total_bytes + len(content) > max_total_bytes:
+                raise ValueError(f"Cannot include {fpath}: 200000 character total limit")
             total_bytes += len(content)
             file_context_parts.append(f"=== FILE: {fpath} ===\n{content}\n=== END: {fpath} ===")
             file_entries.append(
@@ -913,11 +1190,9 @@ def run(
     if output_format is not None:
         normalized_format = _format_aliases.get(output_format.strip().lower())
         if normalized_format is None:
-            console.print(
-                f"[red]Error:[/red] Invalid --format '{output_format}'. "
-                "Valid values: json, markdown (alias: md)."
+            raise ValueError(
+                f"Invalid --format '{output_format}'. Valid values: json, markdown (alias: md)."
             )
-            raise typer.Exit(1)
         if normalized_format == "json":
             output_json = True
         else:
@@ -936,12 +1211,11 @@ def run(
     # Resolve agent aliases
     resolved_agent, resolved_mode, was_deprecated = _resolve_agent_alias(subagent, mode)
     if route and resolved_agent != "router":
-        console.print("[red]Error:[/red] --route can only be used with the router subagent")
-        raise typer.Exit(1)
+        raise ValueError("--route can only be used with the router subagent")
 
     # Show deprecation warning
-    if was_deprecated and not output_json:
-        _print(
+    if was_deprecated:
+        _warn(
             f"[yellow]Warning:[/yellow] '{subagent}' is deprecated. "
             f"Use '{resolved_agent}' instead. (Will be removed in v1.0)",
         )
@@ -953,14 +1227,40 @@ def run(
         provider_list = config_defaults.get("providers", ["openrouter"])
 
     # Get timeout (CLI > config > default)
-    effective_timeout = timeout or config_defaults.get("timeout", 120)
+    effective_timeout = timeout if timeout is not None else config_defaults.get("timeout", 120)
+    if not 10 <= effective_timeout <= 3600:
+        raise ValueError("Timeout must be between 10 and 3600 seconds")
     max_retries = config_defaults.get("max_retries", 3)
     enable_degradation = config_defaults.get("enable_degradation", True)
 
-    model_list = [m.strip() for m in models.split(",") if m.strip()] if models else None
+    model_list = _parse_models(models, provider_list)
+
+    custom_schema = None
+    if schema_file:
+        if not schema_file.is_file():
+            raise ValueError(f"Schema file not found: {schema_file}")
+        custom_schema = json.loads(schema_file.read_text())
 
     # Handle dry-run
     if dry_run:
+        if output_json or output_file:
+            plan = {
+                "kind": "plan",
+                "execution_status": "not_executed",
+                "subagent": resolved_agent,
+                "mode": resolved_mode,
+                "providers": provider_list,
+                "models": model_list,
+                "timeout": effective_timeout,
+                "context_metadata": context_metadata,
+                "runtime_profile": runtime_profile.value,
+                "reasoning_profile": reasoning_profile.value,
+            }
+            if output_file:
+                _write_result(output_file, json.dumps(plan, indent=2))
+            else:
+                print(json.dumps(plan, indent=2), flush=True)
+            return
         effective_schema: str = str(schema_file) if schema_file else "default"
         if not schema_file:
             try:
@@ -988,7 +1288,7 @@ def run(
         _print(f"  Task: {task_text[:100]}{'...' if len(task_text) > 100 else ''}")
         return
 
-    if not output_json:
+    if not output_json and not output_file:
         mode_str = f" --mode {resolved_mode}" if resolved_mode else ""
         if model_list and len(model_list) > 1:
             _print(
@@ -1004,14 +1304,6 @@ def run(
     try:
         from llm_council import Council
         from llm_council.protocol.types import CouncilConfig
-
-        # Load custom schema if provided
-        custom_schema = None
-        if schema_file:
-            if not schema_file.exists():
-                console.print(f"[red]Error:[/red] Schema file not found: {schema_file}")
-                raise typer.Exit(1)
-            custom_schema = json.loads(schema_file.read_text())
 
         config = CouncilConfig(
             providers=provider_list,
@@ -1036,9 +1328,10 @@ def run(
         )
 
         council = Council(config=config)
-        result = asyncio.run(
-            council.run(task=task_text, subagent=resolved_agent, follow_router=route)
+        result = _execute_run(
+            lambda: council.run(task=task_text, subagent=resolved_agent, follow_router=route)
         )
+        result = _prepare_report_result(result)
 
         if markdown_output:
             output_payload = _render_result_markdown(
@@ -1051,30 +1344,28 @@ def run(
 
         # Write to file or stdout
         if output_file:
-            output_file.parent.mkdir(parents=True, exist_ok=True)
-            output_file.write_text(output_payload)
-            _print(f"[green]Output written to {output_file}[/green]")
+            _write_result(output_file, output_payload)
         elif markdown_output:
             print(output_payload, end="" if output_payload.endswith("\n") else "\n")
         elif output_json:
-            print(output_payload)
+            print(output_payload, flush=True)
         else:
-            if result.success:
-                console.print(
-                    Panel(
-                        json.dumps(result.output, indent=2),
-                        title="[green]Council Result: SUCCESS[/green]",
-                        border_style="green",
-                    )
-                )
-            else:
-                console.print(
-                    Panel(
-                        "\n".join(result.validation_errors or ["Unknown error"]),
-                        title="[red]Council Result: FAILED[/red]",
-                        border_style="red",
-                    )
-                )
+            status = _execution_status(result)
+            style = (
+                "green" if status == "completed" else "yellow" if status == "degraded" else "red"
+            )
+            body = (
+                json.dumps(result.output, indent=2)
+                if result.success or result.output is not None
+                else "\n".join(result.validation_errors or [result.error or "Unknown error"])
+            )
+            console.print(
+                Panel(Text(body), title=f"Council Result: {status.upper()}", border_style=style)
+            )
+            diagnostics = _result_diagnostics(result)
+            if diagnostics:
+                console.print("Execution Diagnostics:")
+                console.print(json.dumps(diagnostics, indent=2, default=str), markup=False)
 
             degraded = result.degraded_output
             if degraded is not None:
@@ -1082,7 +1373,7 @@ def run(
                 if degraded.provider:
                     detail.append(f"Provider: {degraded.provider}")
                 if degraded.reason:
-                    detail.append(f"Reason: {degraded.reason}")
+                    detail.append(f"Reason: {_safe_diagnostic(degraded.reason)}")
                 text = degraded.text
                 if isinstance(text, str) and text.strip():
                     preview = text.strip()
@@ -1210,21 +1501,13 @@ def run(
                         f"  Router reasoning: {result.routing_decision.get('reasoning') or 'n/a'}"
                     )
 
-    except Exception as e:
-        if output_json:
-            error_output = json.dumps({"error": str(e)})
-            if output_file:
-                output_file.parent.mkdir(parents=True, exist_ok=True)
-                output_file.write_text(error_output)
-            else:
-                print(error_output)
-        else:
-            console.print(f"[red]Error:[/red] {e}")
-        raise typer.Exit(1)
-    finally:
-        # Flush both streams so piped consumers (tee, head, etc.) see EOF promptly.
         sys.stdout.flush()
         sys.stderr.flush()
+        if not result.success:
+            signum = getattr(result, "signal_number", None)
+            raise typer.Exit(128 + signum if isinstance(signum, int) else 1)
+    except Exception:
+        raise
 
 
 @app.command()
@@ -1362,7 +1645,11 @@ def doctor(
     async def _run_deep_probe(name: str, provider: Any) -> dict[str, Any]:
         from time import perf_counter
 
-        from llm_council.providers.base import GenerateRequest
+        from llm_council.providers.base import (
+            GenerateRequest,
+            GenerateResponse,
+            ensure_text_response,
+        )
 
         start = perf_counter()
         async with provider_call_slot(name, timeout_seconds=max(float(probe_timeout), 1.0)):
@@ -1373,10 +1660,13 @@ def doctor(
                 )
             )
         latency_ms = round((perf_counter() - start) * 1000, 1)
-        text = (response.text if hasattr(response, "text") else str(response)).strip()
+        if not isinstance(response, GenerateResponse):
+            raise TypeError("Deep probe requires a non-streaming GenerateResponse.")
+        ensure_text_response(response, provider=name, phase="probe")
+        text = (response.text or "").strip()
         return {
             "probe_ok": True,
-            "probe_message": text[:120] or "Probe completed",
+            "probe_message": text[:120],
             "probe_latency_ms": latency_ms,
         }
 
@@ -1391,6 +1681,9 @@ def doctor(
                 "message": result.message or "",
                 "latency_ms": result.latency_ms,
             }
+            details = dict(result.details or {})
+            if details:
+                payload["details"] = details
             if deep:
                 if result.ok:
                     try:
@@ -1698,7 +1991,7 @@ def _build_eval_base_config(
 
     from llm_council.protocol.types import CouncilConfig
 
-    model_list = [m.strip() for m in models.split(",") if m.strip()] if models else None
+    model_list = _parse_models(models, provider_list)
     effective_timeout = (
         timeout_override if timeout_override is not None else config_defaults.get("timeout", 120)
     )

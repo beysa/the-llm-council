@@ -1036,7 +1036,7 @@ class TestOutputFormatConfig:
 
         with (
             patch("llm_council.Council") as mock_council_class,
-            patch("asyncio.run") as mock_run,
+            patch("llm_council.cli.main._execute_run") as mock_run,
             patch(
                 "llm_council.cli.main._load_config_defaults",
                 return_value={"output_format": "json"},
@@ -1046,10 +1046,8 @@ class TestOutputFormatConfig:
             mock_run.return_value = mock_result
 
             result = runner.invoke(app, ["run", "router", "Test task"])
-            assert result.exit_code in [0, 1]
-            # Should produce JSON output (no rich panels)
-            if result.exit_code == 0:
-                assert "Council Result" not in result.stdout
+            assert result.exit_code == 0
+            assert "Council Result" not in result.stdout
 
     def test_run_json_flag_overrides_config(self):
         """Explicit --json flag works even with no config."""
@@ -1063,7 +1061,7 @@ class TestOutputFormatConfig:
 
         with (
             patch("llm_council.Council") as mock_council_class,
-            patch("asyncio.run") as mock_run,
+            patch("llm_council.cli.main._execute_run") as mock_run,
             patch(
                 "llm_council.cli.main._load_config_defaults",
                 return_value={},
@@ -1073,7 +1071,7 @@ class TestOutputFormatConfig:
             mock_run.return_value = mock_result
 
             result = runner.invoke(app, ["run", "router", "Test task", "--json"])
-            assert result.exit_code in [0, 1]
+            assert result.exit_code == 0
 
     def test_run_rich_output_when_config_not_json(self):
         """Non-json output_format preserves rich output."""
@@ -1088,7 +1086,7 @@ class TestOutputFormatConfig:
 
         with (
             patch("llm_council.Council") as mock_council_class,
-            patch("asyncio.run") as mock_run,
+            patch("llm_council.cli.main._execute_run") as mock_run,
             patch(
                 "llm_council.cli.main._load_config_defaults",
                 return_value={"output_format": "rich"},
@@ -1098,7 +1096,7 @@ class TestOutputFormatConfig:
             mock_run.return_value = mock_result
 
             result = runner.invoke(app, ["run", "router", "Test task"])
-            assert result.exit_code in [0, 1]
+            assert result.exit_code == 0
 
     def test_doctor_uses_output_format_json_from_config(self):
         """Doctor command respects output_format config."""
@@ -1142,7 +1140,7 @@ class TestMarkdownOutputFormat:
             resolved_mode="impl",
             provider_list=["openrouter"],
         )
-        assert md.startswith("# Council Result: SUCCESS")
+        assert md.startswith("# Council Result: COMPLETED")
         assert "## Output" in md
         assert '"result": "ship it"' in md
         assert "## Critique" in md
@@ -1190,7 +1188,7 @@ class TestMarkdownOutputFormat:
 
         with (
             patch("llm_council.Council") as mock_council_class,
-            patch("asyncio.run") as mock_run,
+            patch("llm_council.cli.main._execute_run") as mock_run,
             patch(
                 "llm_council.cli.main._load_config_defaults",
                 return_value={},
@@ -1201,7 +1199,7 @@ class TestMarkdownOutputFormat:
 
             result = runner.invoke(app, ["run", "router", "Test task", "--format", "markdown"])
             assert result.exit_code == 0
-            assert "# Council Result: SUCCESS" in result.stdout
+            assert "# Council Result: COMPLETED" in result.stdout
             assert "## Metrics" in result.stdout
 
     def test_run_format_md_alias(self):
@@ -1210,7 +1208,7 @@ class TestMarkdownOutputFormat:
 
         with (
             patch("llm_council.Council") as mock_council_class,
-            patch("asyncio.run") as mock_run,
+            patch("llm_council.cli.main._execute_run") as mock_run,
             patch(
                 "llm_council.cli.main._load_config_defaults",
                 return_value={},
@@ -1221,7 +1219,7 @@ class TestMarkdownOutputFormat:
 
             result = runner.invoke(app, ["run", "router", "Test task", "--format", "md"])
             assert result.exit_code == 0
-            assert "# Council Result: SUCCESS" in result.stdout
+            assert "# Council Result: COMPLETED" in result.stdout
 
     def test_run_format_json_matches_json_flag(self):
         """--format json behaves like --json (raw JSON, no rich panel)."""
@@ -1232,7 +1230,7 @@ class TestMarkdownOutputFormat:
 
         with (
             patch("llm_council.Council") as mock_council_class,
-            patch("asyncio.run") as mock_run,
+            patch("llm_council.cli.main._execute_run") as mock_run,
             patch(
                 "llm_council.cli.main._load_config_defaults",
                 return_value={},
@@ -1250,7 +1248,7 @@ class TestMarkdownOutputFormat:
         """An unknown --format value exits with an error before running the council."""
         with (
             patch("llm_council.Council") as mock_council_class,
-            patch("asyncio.run") as mock_run,
+            patch("llm_council.cli.main._execute_run") as mock_run,
             patch(
                 "llm_council.cli.main._load_config_defaults",
                 return_value={},
@@ -1261,16 +1259,19 @@ class TestMarkdownOutputFormat:
 
             result = runner.invoke(app, ["run", "router", "Test task", "--format", "yaml"])
             assert result.exit_code == 1
-            assert "Invalid --format" in result.stdout
+            assert result.stdout == ""
+            assert "Invalid --format" in result.stderr
 
     def test_run_format_markdown_writes_file(self, tmp_path):
-        """--format markdown with --output writes Markdown (not JSON) to the file."""
+        """Explicit Markdown format keeps its legacy output-file content."""
         out_file = tmp_path / "result.md"
-        mock_result = self._success_result()
+        from llm_council.engine.orchestrator import CouncilResult
+
+        mock_result = CouncilResult(success=True, output={"result": "ship it"})
 
         with (
             patch("llm_council.Council") as mock_council_class,
-            patch("asyncio.run") as mock_run,
+            patch("llm_council.cli.main._execute_run") as mock_run,
             patch(
                 "llm_council.cli.main._load_config_defaults",
                 return_value={},
@@ -1286,8 +1287,12 @@ class TestMarkdownOutputFormat:
             assert result.exit_code == 0
             assert out_file.exists()
             content = out_file.read_text()
-            assert content.startswith("# Council Result: SUCCESS")
-            assert "## Metrics" in content
+            assert content == (
+                "# Council Result: COMPLETED\n\n## Output\n\n```json\n"
+                '{\n  "result": "ship it"\n}\n```\n\n## Metrics\n\n'
+                "- Duration: 0ms\n- Synthesis attempts: 1\n- Providers: openrouter\n"
+            )
+            assert result.stdout == ""
 
     def test_run_config_output_format_markdown(self):
         """config output_format: markdown renders Markdown when no CLI flag is given."""
@@ -1295,7 +1300,7 @@ class TestMarkdownOutputFormat:
 
         with (
             patch("llm_council.Council") as mock_council_class,
-            patch("asyncio.run") as mock_run,
+            patch("llm_council.cli.main._execute_run") as mock_run,
             patch(
                 "llm_council.cli.main._load_config_defaults",
                 return_value={"output_format": "markdown"},
@@ -1306,7 +1311,7 @@ class TestMarkdownOutputFormat:
 
             result = runner.invoke(app, ["run", "router", "Test task"])
             assert result.exit_code == 0
-            assert "# Council Result: SUCCESS" in result.stdout
+            assert "# Council Result: COMPLETED" in result.stdout
 
 
 class TestCLIGitDiffEvidence:
@@ -1354,13 +1359,12 @@ class TestCLIContextMetadata:
     """Tests for file-ingestion metadata passed into council runs."""
 
     def test_run_passes_file_truncation_metadata_into_config(self, tmp_path):
-        """Run should preserve truncation and skip decisions in context metadata."""
+        """Run must reject an explicitly requested file that would be skipped."""
         large_files = []
         for index in range(1, 6):
             path = tmp_path / f"large-{index}.md"
             path.write_text("x" * 60_000)
             large_files.append(path)
-        skipped_file = large_files[-1]
         mock_result = MagicMock()
         mock_result.success = True
         mock_result.output = {"result": "test"}
@@ -1369,7 +1373,7 @@ class TestCLIContextMetadata:
 
         with (
             patch("llm_council.Council") as mock_council_class,
-            patch("asyncio.run") as mock_run,
+            patch("llm_council.cli.main._execute_run") as mock_run,
             patch("llm_council.cli.main._load_config_defaults", return_value={}),
         ):
             mock_council = MagicMock()
@@ -1387,24 +1391,14 @@ class TestCLIContextMetadata:
                 ],
             )
 
-        assert result.exit_code in [0, 1]
-        council_config = mock_council_class.call_args.kwargs["config"]
-        files = council_config.context_metadata["files"]
-        assert any(
-            item["path"] == str(large_files[0])
-            and item["truncated"] is True
-            and item["status"] == "included"
-            for item in files
-        )
-        assert any(
-            item["path"] == str(skipped_file) and item["status"] == "skipped_total_limit"
-            for item in files
-        )
-        assert council_config.context_metadata["warnings"]
+        assert result.exit_code == 1
+        assert json.loads(result.stdout)["execution_status"] == "failed"
+        mock_council_class.assert_not_called()
 
     def test_run_keeps_file_warnings_out_of_stdout_json(self, tmp_path):
         """File-ingestion warnings should not pollute stdout JSON payloads."""
-        missing_file = tmp_path / "missing.md"
+        reference_file = tmp_path / "large.md"
+        reference_file.write_text("x" * 50_001)
         mock_result = MagicMock()
         mock_result.success = True
         mock_result.output = {"result": "test"}
@@ -1413,7 +1407,7 @@ class TestCLIContextMetadata:
 
         with (
             patch("llm_council.Council") as mock_council_class,
-            patch("asyncio.run") as mock_run,
+            patch("llm_council.cli.main._execute_run") as mock_run,
             patch("llm_council.cli.main._load_config_defaults", return_value={}),
         ):
             mock_council_class.return_value = MagicMock()
@@ -1426,14 +1420,15 @@ class TestCLIContextMetadata:
                     "critic",
                     "Review the benchmark plan",
                     "--files",
-                    str(missing_file),
+                    str(reference_file),
                     "--json",
                 ],
             )
 
-        assert result.exit_code in [0, 1]
+        assert result.exit_code == 0
         assert '"success": true' in result.stdout
-        assert "File not found" not in result.stdout
+        assert "Truncated" not in result.stdout
+        assert "Truncated" in result.stderr
 
 
 class TestCLIEvaluate:
@@ -1829,12 +1824,12 @@ class TestCLIRun:
     def test_run_requires_arguments(self):
         """Test run requires subagent and task."""
         result = runner.invoke(app, ["run"])
-        assert result.exit_code != 0
+        assert result.exit_code == 2
 
     def test_run_with_missing_task(self):
         """Test run with subagent but no task."""
         result = runner.invoke(app, ["run", "router"])
-        assert result.exit_code != 0
+        assert result.exit_code == 1
 
     def test_run_basic(self):
         """Test basic run command."""
@@ -1848,13 +1843,11 @@ class TestCLIRun:
             mock_council = MagicMock()
             mock_council_class.return_value = mock_council
 
-            # Mock asyncio.run to return our mock result
-            with patch("asyncio.run") as mock_run:
+            with patch("llm_council.cli.main._execute_run") as mock_run:
                 mock_run.return_value = mock_result
 
                 result = runner.invoke(app, ["run", "router", "Test task"])
-                # Command should complete (may show result or error depending on output parsing)
-                assert result.exit_code in [0, 1]  # Either success or handled error
+                assert result.exit_code == 0
 
     def test_run_with_json_output(self):
         """Test run with --json flag."""
@@ -1874,12 +1867,12 @@ class TestCLIRun:
             mock_council = MagicMock()
             mock_council_class.return_value = mock_council
 
-            with patch("asyncio.run") as mock_run:
+            with patch("llm_council.cli.main._execute_run") as mock_run:
                 mock_run.return_value = mock_result
 
                 result = runner.invoke(app, ["run", "router", "Test task", "--json"])
                 # JSON output should be produced
-                assert result.exit_code in [0, 1]
+                assert result.exit_code == 0
 
     def test_run_with_providers(self):
         """Test run with custom providers."""
@@ -1893,7 +1886,7 @@ class TestCLIRun:
             mock_council = MagicMock()
             mock_council_class.return_value = mock_council
 
-            with patch("asyncio.run") as mock_run:
+            with patch("llm_council.cli.main._execute_run") as mock_run:
                 mock_run.return_value = mock_result
 
                 result = runner.invoke(
@@ -1901,7 +1894,7 @@ class TestCLIRun:
                     ["run", "router", "Test task", "--providers", "openai,anthropic"],
                 )
                 # Should attempt to use specified providers
-                assert result.exit_code in [0, 1]
+                assert result.exit_code == 0
 
     def test_run_with_route_flag_forwards_router_followup(self):
         """--route should enable router follow-up in config and run invocation."""
@@ -1935,10 +1928,12 @@ class TestCLIRun:
 
     def test_run_with_route_flag_requires_router_subagent(self):
         """--route is rejected for non-router subagents."""
-        result = runner.invoke(app, ["run", "planner", "Test task", "--route"])
+        with patch("llm_council.cli.main._load_config_defaults", return_value={}):
+            result = runner.invoke(app, ["--no-color", "run", "planner", "Test task", "--route"])
 
         assert result.exit_code == 1
-        assert "--route can only be used with the router subagent" in result.stdout
+        assert result.stdout == ""
+        assert result.stderr == "Error: --route can only be used with the router subagent\n"
 
     def test_run_forwards_reasoning_profile(self):
         """Run should pass through the reasoning-profile override."""
@@ -1958,7 +1953,7 @@ class TestCLIRun:
                 ["run", "router", "Test task", "--reasoning-profile", "light"],
             )
 
-        assert result.exit_code in [0, 1]
+        assert result.exit_code == 0
         council_config = mock_council_class.call_args.kwargs["config"]
         assert council_config.reasoning_profile.value == "light"
 
@@ -1980,6 +1975,6 @@ class TestCLIRun:
                 ["run", "router", "Test task", "--runtime-profile", "bounded"],
             )
 
-        assert result.exit_code in [0, 1]
+        assert result.exit_code == 0
         council_config = mock_council_class.call_args.kwargs["config"]
         assert council_config.runtime_profile.value == "bounded"

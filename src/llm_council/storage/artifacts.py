@@ -13,6 +13,7 @@ import hashlib
 import os
 import shutil
 import sqlite3
+import tempfile
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -54,6 +55,8 @@ class Phase(str, Enum):
     DRAFT = "draft"
     CRITIQUE = "critique"
     SYNTHESIS = "synthesis"
+    # Council's own started/settled execution manifest (not provider output).
+    MANIFEST = "manifest"
 
 
 @dataclass
@@ -506,13 +509,13 @@ class ArtifactStore:
         count_tokens: bool = True,
     ) -> Artifact:
         """
-        Store an artifact, returning existing if content matches (dedup).
+        Store a phase occurrence, sharing content-addressed file bytes.
 
         Args:
             run_id: The run this artifact belongs to
             content: Full artifact content
             artifact_type: Type of artifact
-            force_new: Skip deduplication check
+            force_new: Create another occurrence even if its identity matches
             provider: Provider that produced this content (None = not recorded)
             phase: Pipeline phase that produced it (None = not recorded)
             count_tokens: Whether to add this artifact's tokens to the run's
@@ -554,10 +557,10 @@ class ArtifactStore:
                 cursor.execute(
                     """
                     SELECT * FROM artifacts
-                    WHERE content_hash = ? AND run_id = ?
+                    WHERE content_hash = ? AND run_id = ? AND artifact_type = ?
                       AND provider IS ? AND phase IS ?
                     """,
-                    (content_hash, run_id, provider, phase_value),
+                    (content_hash, run_id, artifact_type.value, provider, phase_value),
                 )
                 row = cursor.fetchone()
 
@@ -566,20 +569,23 @@ class ArtifactStore:
 
         # Create new artifact with safe path
         artifact_id = str(uuid.uuid4())
-        file_path = self.artifact_dir / f"{artifact_id}.txt"
+        file_path = self.artifact_dir / f"{hashlib.sha256(content.encode()).hexdigest()}.txt"
 
         # Security: Ensure path is contained
         self._ensure_path_containment(file_path)
 
         # Write content atomically
-        temp_path = file_path.with_suffix(".tmp")
+        temp_path = None
         try:
-            with open(temp_path, "w", encoding="utf-8") as f:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=self.artifact_dir, delete=False
+            ) as f:
+                temp_path = Path(f.name)
                 f.write(content)
-            temp_path.rename(file_path)
-        except Exception:
-            temp_path.unlink(missing_ok=True)
-            raise
+            temp_path.replace(file_path)
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
 
         artifact = Artifact(
             artifact_id=artifact_id,

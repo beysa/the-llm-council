@@ -18,6 +18,8 @@ from llm_council.providers.anthropic import (
     STRUCTURED_OUTPUT_MODELS as ANTHROPIC_STRUCTURED_OUTPUT_MODELS,
 )
 from llm_council.providers.base import GenerateRequest, ReasoningConfig, StructuredOutputConfig
+from llm_council.providers.cli.codex import _VERIFIED_VERSION as CODEX_CLI_VERSION
+from llm_council.providers.cli.codex import _VERIFIED_VERSIONS as CODEX_CLI_VERSIONS
 from llm_council.providers.gemini import LEGACY_MODEL_PREFIXES, STRUCTURED_OUTPUT_MODEL_PREFIXES
 from llm_council.providers.openai import (
     JSON_MODE_ONLY_MODELS,
@@ -70,12 +72,16 @@ class CompiledProviderRequest:
 
     request: GenerateRequest
     decisions: tuple[CompilationDecision, ...]
+    reasoning_control: dict[str, str | list[str]] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        metadata: dict[str, Any] = {
             "model": self.request.model,
             "decisions": [decision.to_dict() for decision in self.decisions],
         }
+        if self.reasoning_control is not None:
+            metadata["reasoning_control"] = dict(self.reasoning_control)
+        return metadata
 
 
 def compile_request_for_provider(
@@ -410,7 +416,86 @@ def compile_request_for_provider(
             provider_label="Gemini CLI",
         )
 
-    return CompiledProviderRequest(request=compiled, decisions=tuple(decisions))
+    if identity in {"claude", "codex"} and compiled.max_tokens is not None:
+        update(max_tokens=None)
+        decide(
+            "max_tokens",
+            "dropped",
+            f"requested max_tokens={request.max_tokens} is not enforced; "
+            "no verified whole-generation output token limit; "
+            "native output may exceed requested limit; timeout still applies",
+        )
+
+    reasoning_control = None
+    if identity in {"codex", "claude", "gemini-cli"}:
+        reasoning, reasoning_control = _compile_cli_reasoning(identity, compiled, decide)
+        update(reasoning=reasoning)
+
+    return CompiledProviderRequest(
+        request=compiled, decisions=tuple(decisions), reasoning_control=reasoning_control
+    )
+
+
+def _compile_cli_reasoning(
+    identity: str, request: GenerateRequest, decide: Any
+) -> tuple[ReasoningConfig | None, dict[str, str | list[str]]]:
+    reasoning = request.reasoning
+    if reasoning is None:
+        return None, {"status": "uncontrolled"}
+
+    effort = reasoning.effort
+    if identity == "codex" and not reasoning.enabled and effort in (None, "none"):
+        effort = "none"
+    supported = (
+        identity == "codex"
+        and effort in {"high", "low", "none"}
+        and (reasoning.enabled or effort == "none")
+    ) or (
+        identity == "claude"
+        and request.model == "claude-opus-5"
+        and reasoning.enabled
+        and effort in {"high", "low"}
+    )
+    if not supported:
+        decide(
+            "reasoning",
+            "dropped",
+            f"{identity} has no verified mapping for this reasoning request/model; "
+            "native effort remains uncontrolled, not off",
+        )
+        return None, {"status": "uncontrolled"}
+
+    for option in ("budget_tokens", "thinking_level"):
+        if getattr(reasoning, option) is not None:
+            decide(f"reasoning.{option}", "ignored", f"{identity} uses native effort, not {option}")
+    if identity == "claude":
+        decide(
+            "reasoning.effort",
+            "supported",
+            f"Native effort={effort}; adapter checks required CLI flags at runtime, "
+            "not an exact build list; advertised syntax is not behavioral verification",
+        )
+        return ReasoningConfig(enabled=reasoning.enabled, effort=reasoning.effort), {
+            "status": "requested",
+            "effort": str(effort),
+            "cli_version_requirement": "capability_based",
+            "required_cli_flags": ["--effort"],
+        }
+    version = CODEX_CLI_VERSION
+    versions = CODEX_CLI_VERSIONS
+    decide(
+        "reasoning.effort",
+        "supported",
+        f"Native effort={effort}; adapter admits only verified versions: {', '.join(versions)}",
+    )
+    return ReasoningConfig(enabled=reasoning.enabled, effort=reasoning.effort), {
+        "status": "requested",
+        "effort": str(effort),
+        "requires_cli_version": version,
+        "cli_version_requirement": "verified_versions_only",
+        "verified_baseline_cli_version": version,
+        "supported_cli_versions": list(versions),
+    }
 
 
 def _drop_cli_only_options(
@@ -439,9 +524,6 @@ def _drop_cli_only_options(
     if compiled.response_format is not None:
         update(response_format=None)
         decide("response_format", "dropped", f"{provider_label} does not support response_format")
-    if compiled.reasoning and compiled.reasoning.enabled:
-        update(reasoning=None)
-        decide("reasoning", "dropped", f"{provider_label} does not support reasoning controls")
     if compiled.structured_output and not allow_structured_output:
         update(structured_output=None)
         decide(

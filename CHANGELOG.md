@@ -32,6 +32,176 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   itself. Let the shell expand them instead: `$env:VAR` in PowerShell, `%VAR%` in
   cmd.exe.
 
+## [0.8.4] - 2026-10-09
+
+See [the release record](docs/releases/0.8.4.md) for scope and verification.
+
+### Fixed
+- Claude CLI no longer rejects routine updates because their exact build is
+  absent from a hardcoded list. Admission checks required option definitions
+  on every request, with auth-route and optional-effort awareness, within the
+  existing deadline. Missing controls fail before prompt dispatch; isolation,
+  managed-policy checks and terminal validation are not relaxed.
+- Claude doctor/compiler metadata distinguish capability advertisement from
+  authentication, generation and native behavioral proof. Codex's version policy
+  is unchanged. Current docs and the shipped skill explain the separate policies.
+
+## [0.8.3] - 2026-10-06
+
+Tested candidate, not a publication or global-install claim. See
+[the release record](docs/releases/0.8.3.md) for exact proof and limitations.
+
+### Reporting Repair Scope
+- Resolve omitted models from instantiated adapter defaults before capability
+  compilation through an optional, non-abstract `resolve_model` hook. The hook
+  is backward compatible, does not re-read the environment or change defaults,
+  and preserves explicit model choices. Attempt metadata distinguishes
+  `adapter_resolved_model` from requested and reported models; resolution is not
+  explicit selection or provider confirmation.
+- Restore schema forwarding for OpenAI's `gpt-5.4` default. Existing policy still
+  forwards reasoning controls only for o-series models, not `gpt-5.4`; the
+  capability matrix is unchanged and o-series controls have regression coverage.
+- Add a built-in-reviewer prompt boundary that treats bounded prepared-coverage
+  metadata as data, not source evidence. Security/custom schemas are unchanged;
+  no task-intent detector or semantic regex filter. Public result schemas are
+  unchanged; the optional adapter hook above is additive.
+- Remove the prose-manufacturing reviewer fallback and its exclusive helpers.
+  Schema-validation exhaustion fails while preserving drafts, critique and errors;
+  invalid raw synthesis is artifact-only if storage succeeds. Exception-triggered
+  fallback to an existing schema-valid JSON draft remains degraded, not proof
+  of semantic truth.
+- Admit exact Codex 0.160.1 with version-specific tool controls that preserve
+  authentication, selected model and reasoning effort. The unchanged `gpt-5.4`
+  default is absent from its tested catalog; an explicit supported model is
+  required. This is not universal model or future-version support.
+- Use `execution_status` across JSON, Markdown and console; a legacy success
+  boolean does not establish full review coverage or correct findings.
+- Separate file ingestion from delivered source coverage and downstream draft
+  compaction, including profile 0 and submitted versus unsent candidates. Only
+  submitted evidence cuts count toward compaction-based degradation. Keep
+  pipeline limitations separate from findings about the reviewed source.
+- Account for executed retries and synthesis attempts, including failed calls
+  before fallback, excluding queued requests that never start the adapter;
+  retain completed evidence on handled cancellation.
+- Preserve phase/provider artifact occurrences and expose persistence errors.
+  Hard-killed `running` ledger rows are not liveness proof and are not repaired
+  automatically.
+- Distinguish Council runtime identity, selected native executable/version and
+  requested model for CLI and library callers; do not label the requested model
+  provider-confirmed. Persist allowlisted `started`/`settled` execution manifests;
+  the settled snapshot precedes ledger finalization. Hard kills may retain only
+  the start snapshot, not later native identity; no heartbeat or repair is added.
+- Reject provider-prefixed `provider:model` mappings while preserving official
+  slash namespaces and colon suffixes in literal model IDs.
+- Update shipped skill, command and plugin target to 0.8.3. Document approved
+  exact-version uv tool reinstalls that replace the executable and stored pin,
+  rather than treating isolated test installs as global upgrades.
+
+### Verification Boundary
+- Full source suite: 1,237 passed, 52 opt-in skipped, 84% coverage. Dev-only
+  CI-equivalent suite: 1,222 passed, 67 skipped, including 15 additional optional
+  SDK skips. Isolated installed-v5 regressions: 155 passed; source byte-identical.
+- Contained native checks: 34/34 cases on Codex 0.160.1 with configured
+  `gpt-6.1-sol`, 34/34 on Codex 0.149.1, and 23 unchanged Claude native cases.
+  Codex 0.153.3 retains historical native evidence and synthetic coverage, with
+  no fresh native matrix.
+- Final v5 API attribution acceptance passed with one OpenAI synthesis and
+  restored `gpt-5.4` schema forwarding; reasoning remains dropped by existing
+  policy. Partial source/draft coverage was truthfully degraded, not a full review.
+- Claude's explicit-model v4 caller passed. The original Codex v4 caller failed
+  to read its completed result; a later read-only correction passed without a
+  Council rerun or full caller re-pass. Hermes remains deferred. Copied-contract
+  tests do not certify an installed plugin. Publication/global-install receipts
+  remain separate from this candidate verification.
+
+## [0.8.2] - 2026-10-06
+
+### Fixed
+- Native CLI compatibility admits separately verified releases instead of one
+  exact version: Codex 0.149.1 and 0.153.3; Claude Code 2.1.288 through 2.1.292.
+  Errors and doctor identify the executable/version. Unknown updates still fail
+  closed; no unverified range or isolation bypass is introduced. (#64)
+- Synthesis compaction retains draft findings even when full source context is
+  omitted. Requests that cannot fit the provider budget are not sent. Reviews
+  cannot accept an explicit zero-files result when files were supplied, or
+  manufacture an approving fallback without findings. (#63)
+- Mixed chunked and whole-file drafts preserve downstream context containment;
+  a whole-file peer cannot restore the raw source after a chunked peer. (#63)
+- Downstream evidence-size metadata counts retained material, not omitted raw
+  context. Exception diagnostics respect suppressed/redacted context and stop
+  safely when a cause chain contains a cycle.
+- Empty and whitespace-only generations fail with `empty_response`, provider,
+  phase, sanitized finish reason, and tool-call presence. They are not retried as
+  transport errors. All-empty drafts stop before critique and synthesis, including
+  when graceful degradation is disabled. (#65, #67)
+- Chunked drafts honor an explicit `--max-tokens` value instead of silently
+  reducing it to the 900-token default chunk cap. This allows a caller to raise
+  an insufficient output budget without changing models or reasoning. (#67)
+- Vertex preserves function-call metadata without executing calls or treating
+  thought text as answers. OpenRouter preserves empty-response stop metadata.
+  Deep doctor probes no longer report an empty response as successful. (#65, #67)
+- OpenRouter no longer treats JSON found in reasoning fields as a final answer,
+  including structured-output requests with empty final content. (#67)
+
+### Changed
+- `--timeout` accepts 10 through 3600 seconds per provider attempt. The default
+  remains 120 seconds; bounded-profile caps and finite cancellation cleanup stay
+  unchanged. This is not a whole-workflow deadline. (#66)
+- Existing per-file truncation metadata also appears as structured
+  `degradation_report.context_warnings`. File caps remain 50,000 characters per
+  file and 200,000 total; truncated reviews remain degraded. (#66)
+- Shipped skill and command guidance requires 0.8.2 and explains partial context,
+  empty responses, per-attempt budgets, and the limits of doctor probes.
+
+## [0.8.1] - 2026-10-05
+
+### Fixed
+- CLI provider adapters distinguish terminal completion from intermediate text
+  and structured errors. Codex preserves system instructions in its native
+  instruction channel instead of dropping them.
+- Provider attempt deadlines include queue wait and subprocess discovery.
+  Cancellation no longer leaves an abandoned waiter that can later take a slot.
+- Codex and Claude request waits preserve cancellation when subprocess startup
+  or generation completes concurrently, including on Python 3.10. Cleanup keeps
+  its separate finite allowance and cannot turn cancellation into a successful
+  provider response.
+- Native model-capacity and overload responses use the existing transient retry
+  policy instead of being misclassified as permanently unavailable models.
+  Retry limits and permanent auth, billing and unsupported-model handling remain
+  unchanged.
+- Native response metadata such as `fallback_credit` no longer turns an
+  authentication or rate-limit failure into a false billing error.
+- Whole-file reviews no longer imply degraded execution solely because the
+  default local Git-diff collector has no diff. Missing explicitly requested
+  caller/router capabilities still make execution degraded; pending evidence
+  remains inspectable and completion does not certify evidence sufficiency.
+- Default-mode critique can omit the full output-schema dump before shortening
+  drafts further when the first prompt exceeds its provider budget. Reference
+  material and final schema handling are unchanged; metadata and a warning expose
+  the omission rather than implying equivalent schema-specific critique.
+- Explicit missing or entirely skipped reference files fail before provider
+  calls. Partial truncation remains visible and marks the result degraded.
+
+### Added
+- An additive `execution_status` result field: `completed`, `degraded`, `failed`,
+  or `cancelled`. A review verdict such as `request_changes` is not an execution
+  failure. Callers must inspect status and diagnostics, not only exit code.
+- A portable invocation contract for Codex, Claude Code, Hermes and generic
+  subprocess callers, including executable identity and full result capture.
+
+### Changed
+- Failed runs now exit 1; parser errors remain 2 and handled SIGINT/SIGTERM use
+  130/143. Valid degraded results retain exit 0 with `success: true`.
+- JSON runs separate diagnostics from stdout. Result files are written atomically;
+  explicit Markdown file output remains supported. JSON dry runs are labelled
+  `kind: plan` and `execution_status: not_executed`.
+- Native CLI request controls require a verified CLI contract. Reasoning mappings
+  record supported effort or explicitly uncontrolled behavior; omission does not
+  establish that native reasoning is off.
+- Claude and Codex CLI compilation explicitly records that `max_tokens` is not
+  an enforced whole-generation output limit. Request deadlines remain separate
+  from token limits; API provider mappings are unchanged.
+
 ## [0.8.0] - 2026-07-22
 
 ### Fixed
@@ -758,7 +928,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Basic provider adapters
 - JSON schema validation for subagent outputs
 
-[Unreleased]: https://github.com/sherifkozman/the-llm-council/compare/v0.7.18...HEAD
+[Unreleased]: https://github.com/sherifkozman/the-llm-council/compare/v0.8.3...HEAD
+[0.8.3]: https://github.com/sherifkozman/the-llm-council/compare/v0.8.2...v0.8.3
+[0.8.2]: https://github.com/sherifkozman/the-llm-council/compare/v0.8.1...v0.8.2
+[0.8.1]: https://github.com/sherifkozman/the-llm-council/compare/v0.8.0...v0.8.1
+[0.8.0]: https://github.com/sherifkozman/the-llm-council/compare/v0.7.18...v0.8.0
 [0.7.18]: https://github.com/sherifkozman/the-llm-council/compare/v0.7.17...v0.7.18
 [0.7.17]: https://github.com/sherifkozman/the-llm-council/compare/v0.7.16...v0.7.17
 [0.7.16]: https://github.com/sherifkozman/the-llm-council/compare/v0.7.15...v0.7.16

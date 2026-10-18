@@ -59,6 +59,60 @@ from llm_council.providers.sakana import SakanaProvider
 from llm_council.providers.vertex import VertexAIProvider
 
 
+@pytest.fixture(autouse=True)
+def isolated_codex_unit_runtime(request, tmp_path, monkeypatch):
+    if "codex" not in request.node.nodeid.lower():
+        return
+    # These tests mock native processes; version/channel proof lives in test_codex_contract.
+    monkeypatch.setattr(os, "environ", {"PATH": os.environ["PATH"], "HOME": str(tmp_path)})
+    monkeypatch.setenv("CODEX_API_KEY", "dummy-unit-codex-key")
+    monkeypatch.setattr(CodexCLIProvider, "_verify_native_contract", AsyncMock())
+    monkeypatch.setattr(
+        CodexCLIProvider, "_generation_catalog", AsyncMock(return_value="/synthetic/models.json")
+    )
+    monkeypatch.setattr("llm_council.providers.cli.codex.terminate_process_tree", AsyncMock())
+
+
+@pytest.fixture
+def claude_probe_processes(tmp_path, monkeypatch):
+    monkeypatch.setattr(os, "environ", {"PATH": os.environ["PATH"], "HOME": str(tmp_path)})
+    # These are command-shape tests; real process cleanup has separate regressions.
+    monkeypatch.setattr("llm_council.providers.cli.claude_code.terminate_process_tree", AsyncMock())
+    version = AsyncMock()
+    version.stdin = MagicMock(drain=AsyncMock())
+    version.returncode = 0
+    version.communicate.return_value = (b"2.1.288 (Claude Code)\n", b"")
+    help_process = AsyncMock()
+    help_process.stdin = MagicMock(drain=AsyncMock())
+    help_process.returncode = 0
+    help_process.communicate.return_value = (
+        (
+            "Options:\n"
+            + "\n".join(
+                f"  {flag}  Option"
+                for flag in (
+                    "-p",
+                    "--output-format <format>",
+                    "--model <model>",
+                    "--setting-sources <sources>",
+                    "--tools <tools...>",
+                    "--strict-mcp-config",
+                    "--mcp-config <configs...>",
+                    "--disable-slash-commands",
+                    "--settings <file-or-json>",
+                    "--no-chrome",
+                    "--no-session-persistence",
+                    "--permission-mode <mode>",
+                    "--permission-prompts <target>",
+                    "--safe-mode",
+                )
+            )
+        ).encode(),
+        b"",
+    )
+    return [version, help_process]
+
+
 class TestProviderCapabilities:
     """Tests for ProviderCapabilities model."""
 
@@ -314,6 +368,141 @@ class TestProviderRegistry:
 
 class TestErrorClassification:
     """Tests for shared provider error classification."""
+
+    def test_claude_auth_failure_with_fallback_credit_metadata_is_auth(self):
+        message = "Not logged in \u00b7 Please run /login"
+        stdout = json.dumps(
+            [
+                {
+                    "type": "assistant",
+                    "error": "authentication_failed",
+                    "is_api_error_message": True,
+                    "message": {
+                        "usage": {"fallback_credit": None},
+                        "content": [{"type": "text", "text": message}],
+                    },
+                },
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": True,
+                    "result": message,
+                    "usage": {"fallback_credit": None},
+                },
+            ]
+        )
+        assert classify_error(stdout, 1) == ErrorType.AUTH
+        assert classify_error(f"stderr: \nstdout: {stdout}", 1) == ErrorType.AUTH
+        provider = ClaudeCodeCLIProvider(cli_path="synthetic")
+        with pytest.raises(RuntimeError, match=r"terminal result failed \(auth, exit 1\)"):
+            provider._parse_response(1, stdout.encode(), b"", {})
+
+    @pytest.mark.parametrize(
+        "message,expected",
+        [
+            ("Unexpected failure", ErrorType.UNKNOWN),
+            ("429 Too many requests", ErrorType.RATE_LIMIT),
+        ],
+    )
+    def test_fallback_credit_metadata_does_not_imply_billing(self, message, expected):
+        details = json.dumps({"error": message, "usage": {"fallback_credit": None}})
+        assert classify_error(details, 1) == expected
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            '{"error":{"code":402,"message":"This request requires more credits, '
+            'or fewer max_tokens. You requested up to 8192 tokens, but can only afford 4096."}}',
+            "Insufficient credits",
+            "Your credit balance is too low to access the Anthropic API.",
+            "Payment required",
+            "insufficient_quota",
+        ],
+    )
+    def test_specific_credit_and_billing_errors_remain_non_retryable(self, message):
+        from llm_council.engine.degradation import DegradationAction, DegradationPolicy
+
+        assert classify_error(message, 1) == ErrorType.BILLING
+        policy = DegradationPolicy(max_retries=2)
+        decision = policy.decide("openrouter", message, "call", 2)
+        assert decision.action == DegradationAction.SKIP
+        assert policy.get_report().total_retries == 0
+        assert decision.fallback_provider is None
+
+    def test_specific_credit_failure_keeps_billing_precedence_over_rate_and_auth(self):
+        message = "This request requires more credits. 429 Too many requests. authentication_failed"
+        assert classify_error(message, 1) == ErrorType.BILLING
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "Selected model is at capacity. Please try a different model.",
+            "MODEL UNAVAILABLE: Reading prompt from stdin...\n"
+            "Selected model is at capacity. Please try a different model.",
+            "The model is currently overloaded. Please try again later.",
+            '{"type":"overloaded_error","message":"Overloaded"}',
+        ],
+    )
+    def test_capacity_and_overload_are_transient_server_errors(self, message):
+        assert classify_error(message, 1) == ErrorType.NETWORK
+
+    @pytest.mark.parametrize("message", ["capacity", "Invalid capacity setting"])
+    def test_bare_capacity_is_not_a_model_or_server_failure(self, message):
+        assert classify_error(message, 1) == ErrorType.UNKNOWN
+
+    @pytest.mark.parametrize(
+        "prefix,expected",
+        [
+            ("Billing: insufficient credits. ", ErrorType.BILLING),
+            ("401 Unauthorized. ", ErrorType.AUTH),
+            ("429 Too many requests. ", ErrorType.RATE_LIMIT),
+        ],
+    )
+    def test_capacity_does_not_override_billing_auth_or_rate_limit(self, prefix, expected):
+        message = prefix + "Selected model is at capacity. Please try a different model."
+        assert classify_error(message, 1) == expected
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "Selected model is at capacity. Please try a different model.",
+            "MODEL UNAVAILABLE: Reading prompt from stdin...\n"
+            "Selected model is at capacity. Please try a different model.",
+            "The model is currently overloaded. Please try again later.",
+        ],
+    )
+    def test_capacity_uses_remaining_retry_then_stops_at_existing_budget(self, message):
+        from llm_council.engine.degradation import DegradationAction, DegradationPolicy
+
+        policy = DegradationPolicy(max_retries=2)
+        first = policy.decide("codex", "Provider attempt deadline expired", "call", 2)
+        assert first.action == DegradationAction.RETRY
+        assert first.retry_delay_ms == 1000
+
+        second = policy.decide("codex", message, "call", 2)
+        assert second.action == DegradationAction.RETRY
+        assert second.retry_delay_ms == 2000
+        assert second.fallback_provider is None
+        event = policy.get_report().failures[-1]
+        assert event.error_type == ErrorType.NETWORK
+        assert event.retry_count == 1
+
+        exhausted = policy.decide("codex", message, "call", 2)
+        assert exhausted.action == DegradationAction.SKIP
+        assert exhausted.fallback_provider is None
+        assert policy.get_report().total_retries == 2
+        assert policy.get_report().failures[-1].retry_count == 2
+
+    @pytest.mark.parametrize("message", ["Unsupported model", "Model not found"])
+    def test_unsupported_and_missing_models_still_skip_without_retry(self, message):
+        from llm_council.engine.degradation import DegradationAction, DegradationPolicy
+
+        assert classify_error(message, 1) == ErrorType.MODEL_UNAVAILABLE
+        policy = DegradationPolicy(max_retries=2)
+        decision = policy.decide("codex", message, "call", 2)
+        assert decision.action == DegradationAction.SKIP
+        assert decision.fallback_provider is None
+        assert policy.get_report().total_retries == 0
 
     def test_classify_timeout_variants(self):
         """Timeout-shaped transport errors should classify as retryable timeouts."""
@@ -642,8 +831,8 @@ class TestAnthropicPromptCaching:
         provider._client = client
 
         async def stream_iter():
-            if False:
-                yield GenerateResponse(text="unused")
+            for response in ():
+                yield response
 
         expected_stream = stream_iter()
 
@@ -658,6 +847,7 @@ class TestAnthropicPromptCaching:
             )
 
         assert result is expected_stream
+        assert [response async for response in result] == []
         call_kwargs = stream.call_args.args[1]
         assert call_kwargs["extra_body"]["cache_control"] == {"type": "ephemeral"}
         assert "cache_control" not in call_kwargs
@@ -1261,7 +1451,17 @@ class TestVertexPromptCaching:
         provider._gemini_client = client
 
         async def stream_chunks():
-            yield SimpleNamespace(text="ok")
+            yield SimpleNamespace(
+                candidates=[
+                    SimpleNamespace(
+                        content=SimpleNamespace(
+                            parts=[SimpleNamespace(text="ok", thought=False, function_call=None)]
+                        ),
+                        finish_reason="STOP",
+                    )
+                ],
+                usage_metadata=None,
+            )
 
         client.aio.caches.create = AsyncMock(
             return_value=SimpleNamespace(name="cachedContents/tmp")
@@ -1902,13 +2102,9 @@ class TestCLIProviderTimeouts:
         assert provider.capabilities.structured_output is True
 
     @pytest.mark.asyncio
-    async def test_codex_cli_rewrites_codex_model_for_chatgpt_auth(self):
-        """`*-codex` models should be normalized when local Codex auth uses ChatGPT."""
+    async def test_codex_cli_preserves_requested_model_identity(self):
+        """Never alias the requested model based on login state."""
         provider = CodexCLIProvider(cli_path="/usr/local/bin/codex")
-
-        login_process = AsyncMock()
-        login_process.communicate.return_value = (b"Logged in using ChatGPT\n", b"")
-        login_process.returncode = 0
 
         exec_process = AsyncMock()
         exec_process.communicate.return_value = (
@@ -1923,23 +2119,24 @@ class TestCLIProviderTimeouts:
 
         with patch(
             "asyncio.create_subprocess_exec",
-            side_effect=[login_process, exec_process],
+            return_value=exec_process,
         ) as mock_exec:
             response = await provider.generate(
                 GenerateRequest(prompt="test", model="gpt-5.4-codex")
             )
 
         assert response.text == "READY"
-        assert mock_exec.await_args_list[1].args[:4] == (
+        mock_exec.assert_awaited_once()
+        assert mock_exec.await_args.args[:4] == (
             "/usr/local/bin/codex",
             "exec",
             "--sandbox",
             "read-only",
         )
-        assert "--json" in mock_exec.await_args_list[1].args
-        assert "-m" in mock_exec.await_args_list[1].args
-        model_index = mock_exec.await_args_list[1].args.index("-m")
-        assert mock_exec.await_args_list[1].args[model_index + 1] == "gpt-5.4"
+        assert "--json" in mock_exec.await_args.args
+        assert "-m" in mock_exec.await_args.args
+        model_index = mock_exec.await_args.args.index("-m")
+        assert mock_exec.await_args.args[model_index + 1] == "gpt-5.4-codex"
 
     @pytest.mark.asyncio
     async def test_codex_cli_error_reports_useful_tail(self):
@@ -1988,32 +2185,42 @@ class TestCLIProviderTimeouts:
             await provider.generate(GenerateRequest(prompt="test"))
 
     @pytest.mark.asyncio
-    async def test_claude_cli_starts_new_session(self):
+    async def test_claude_cli_starts_new_session(self, claude_probe_processes):
         provider = ClaudeCodeCLIProvider(cli_path="/usr/local/bin/claude")
         process = AsyncMock()
-        process.communicate.return_value = (b'{"result": "ok"}', b"")
+        process.stdin = MagicMock(drain=AsyncMock())
+        process.communicate.return_value = (
+            b'{"type":"result","subtype":"success","is_error":false,"result":"ok"}',
+            b"",
+        )
         process.returncode = 0
 
-        with patch("asyncio.create_subprocess_exec", return_value=process) as mock_exec:
+        with patch(
+            "asyncio.create_subprocess_exec", side_effect=[*claude_probe_processes, process]
+        ) as mock_exec:
             response = await provider.generate(GenerateRequest(prompt="test"))
 
         assert response.text == "ok"
         assert mock_exec.await_args.kwargs["start_new_session"] is True
 
     @pytest.mark.asyncio
-    async def test_claude_cli_parses_list_envelopes(self):
+    async def test_claude_cli_parses_list_envelopes(self, claude_probe_processes):
         provider = ClaudeCodeCLIProvider(cli_path="/usr/local/bin/claude")
         process = AsyncMock()
+        process.stdin = MagicMock(drain=AsyncMock())
         process.communicate.return_value = (
             (
-                b'[{"type":"assistant","message":{"content":[{"type":"text","text":"READY"}]}},'
-                b'{"type":"result","usage":{"input_tokens":11,"output_tokens":7}}]'
+                b'[{"type":"assistant","message":{"content":[{"type":"text","text":"EARLIER"}]}},'
+                b'{"type":"result","subtype":"success","is_error":false,"result":"READY",'
+                b'"usage":{"input_tokens":11,"output_tokens":7}}]'
             ),
             b"",
         )
         process.returncode = 0
 
-        with patch("asyncio.create_subprocess_exec", return_value=process):
+        with patch(
+            "asyncio.create_subprocess_exec", side_effect=[*claude_probe_processes, process]
+        ):
             response = await provider.generate(GenerateRequest(prompt="test"))
 
         assert response.text == "READY"
@@ -2174,7 +2381,7 @@ class TestCLIProviderTimeouts:
     async def test_codex_cli_reads_last_message_file(self):
         provider = CodexCLIProvider(cli_path="/usr/local/bin/codex")
         process = AsyncMock()
-        process.communicate.return_value = (b"", b"")
+        process.communicate.return_value = (b'{"type":"turn.completed"}\n', b"")
         process.returncode = 0
         captured_output_path: dict[str, str] = {}
 
@@ -2197,7 +2404,8 @@ class TestCLIProviderTimeouts:
         provider = CodexCLIProvider(cli_path="/usr/local/bin/codex")
         process = AsyncMock()
         process.communicate.return_value = (
-            b'{"type":"item.completed","item":{"type":"agent_message","text":"READY"}}',
+            b'{"type":"item.completed","item":{"type":"agent_message","text":"READY"}}\n'
+            b'{"type":"turn.completed"}\n',
             b"",
         )
         process.returncode = 0
@@ -2206,13 +2414,12 @@ class TestCLIProviderTimeouts:
             patch.dict(
                 "os.environ",
                 {
-                    "OPENAI_API_KEY": "test-openai-key",
+                    "CODEX_API_KEY": "test-codex-key",
                     "CODEX_THREAD_ID": "thread-123",
                     "OTEL_EXPORTER_OTLP_ENDPOINT": "https://telemetry.invalid",
                 },
                 clear=False,
             ),
-            patch.object(provider, "_create_isolated_cli_home", return_value="/tmp/codex-home"),
             patch("asyncio.create_subprocess_exec", return_value=process) as mock_exec,
         ):
             response = await provider.generate(GenerateRequest(prompt="test"))
@@ -2220,9 +2427,11 @@ class TestCLIProviderTimeouts:
         env = mock_exec.await_args.kwargs["env"]
 
         assert response.text == "READY"
-        assert env["HOME"] == "/tmp/codex-home"
-        assert env["OPENAI_API_KEY"] == "test-openai-key"
-        assert env["CODEX_THREAD_ID"] == "thread-123"
+        assert env["HOME"] != os.environ["HOME"]
+        assert env["CODEX_HOME"] == str(Path(env["HOME"]) / ".codex")
+        assert "OPENAI_API_KEY" not in env
+        assert response.raw["auth_category"] == "apikey"
+        assert "CODEX_THREAD_ID" not in env
         assert "OTEL_EXPORTER_OTLP_ENDPOINT" not in env
 
     @pytest.mark.asyncio
@@ -2251,7 +2460,7 @@ class TestCLIProviderTimeouts:
         }
 
     @pytest.mark.asyncio
-    async def test_codex_cli_returns_after_completed_agent_message_without_process_exit(self):
+    async def test_codex_cli_rejects_agent_message_without_process_exit(self):
         provider = CodexCLIProvider(cli_path="/usr/local/bin/codex")
 
         class HangingCodexProcess:
@@ -2283,77 +2492,20 @@ class TestCLIProviderTimeouts:
             process.stderr.feed_eof()
 
         with (
-            patch.object(provider, "_create_isolated_cli_home", return_value="/tmp/codex-home"),
             patch("asyncio.create_subprocess_exec", return_value=process),
             patch(
-                "llm_council.providers.cli.codex._terminate_live_process",
+                "llm_council.providers.cli.codex.terminate_process_tree",
                 side_effect=_fake_terminate,
             ) as mock_terminate,
+            pytest.raises(RuntimeError, match="timed out"),
         ):
             asyncio.create_task(_emit_stdout())
-            response = await provider.generate(GenerateRequest(prompt="test", timeout_seconds=5))
+            await provider.generate(GenerateRequest(prompt="test", timeout_seconds=0.1))
 
-        assert response.text == "READY"
         mock_terminate.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_codex_cli_does_not_return_preamble_before_turn_completed(self):
-        """A pre-tool "here is my plan" message must not be mistaken for the answer.
-
-        Regression: the termination timer used to arm on ANY agent_message, so a
-        model that narrates its plan before running tools was killed ~1s later and
-        that preamble was returned as the final answer.
-        """
-        provider = CodexCLIProvider(cli_path="/usr/local/bin/codex")
-
-        class HangingCodexProcess:
-            def __init__(self) -> None:
-                self.stdout = asyncio.StreamReader()
-                self.stderr = asyncio.StreamReader()
-                self.returncode: int | None = None
-
-            async def wait(self) -> int:
-                while self.returncode is None:
-                    await asyncio.sleep(0)
-                return self.returncode
-
-        process = HangingCodexProcess()
-
-        async def _emit_stdout() -> None:
-            process.stdout.feed_data(b'{"type":"thread.started","thread_id":"abc"}\n')
-            await asyncio.sleep(0.01)
-            process.stdout.feed_data(
-                b'{"type":"item.completed","item":'
-                b'{"type":"agent_message","text":"Here is my plan: inspect the repo."}}\n'
-            )
-            # Tool work happens here; the real answer only arrives afterwards.
-            await asyncio.sleep(0.05)
-            process.stdout.feed_data(
-                b'{"type":"item.completed","item":{"type":"agent_message","text":"FINAL ANSWER"}}\n'
-            )
-            process.stdout.feed_data(b'{"type":"turn.completed"}\n')
-
-        async def _fake_terminate(_proc, grace_seconds: float = 1.0) -> None:
-            process.returncode = -9
-            process.stdout.feed_eof()
-            process.stderr.feed_eof()
-
-        with (
-            patch.object(provider, "_create_isolated_cli_home", return_value="/tmp/codex-home"),
-            patch("asyncio.create_subprocess_exec", return_value=process),
-            patch(
-                "llm_council.providers.cli.codex._terminate_live_process",
-                side_effect=_fake_terminate,
-            ),
-        ):
-            asyncio.create_task(_emit_stdout())
-            response = await provider.generate(GenerateRequest(prompt="test", timeout_seconds=5))
-
-        assert response.text == "FINAL ANSWER"
-        assert "plan" not in response.text
-
-    @pytest.mark.asyncio
-    async def test_codex_cli_fast_fails_when_turn_starts_but_no_answer_arrives(self):
+    async def test_codex_cli_honors_deadline_when_no_answer_arrives(self):
         provider = CodexCLIProvider(cli_path="/usr/local/bin/codex")
 
         class HangingCodexProcess:
@@ -2380,17 +2532,15 @@ class TestCLIProviderTimeouts:
             process.stderr.feed_eof()
 
         with (
-            patch.object(provider, "_create_isolated_cli_home", return_value="/tmp/codex-home"),
-            patch.object(provider, "_stall_after_turn_started_seconds", return_value=0.02),
             patch("asyncio.create_subprocess_exec", return_value=process),
             patch(
-                "llm_council.providers.cli.codex._terminate_live_process",
+                "llm_council.providers.cli.codex.terminate_process_tree",
                 side_effect=_fake_terminate,
             ) as mock_terminate,
-            pytest.raises(RuntimeError, match="stalled after turn.started"),
+            pytest.raises(RuntimeError, match="timed out"),
         ):
             asyncio.create_task(_emit_stdout())
-            await provider.generate(GenerateRequest(prompt="test", timeout_seconds=5))
+            await provider.generate(GenerateRequest(prompt="test", timeout_seconds=0.1))
 
         mock_terminate.assert_awaited_once()
 
@@ -2420,6 +2570,7 @@ class TestCLIProviderTimeouts:
         }
 
     def test_codex_cli_isolated_home_tolerates_missing_auth_files(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("CODEX_API_KEY")
         source_home = tmp_path / "source-home"
         monkeypatch.setattr("llm_council.providers.cli.codex.Path.home", lambda: source_home)
 
@@ -2438,7 +2589,8 @@ class TestCLIProviderTimeouts:
         provider = CodexCLIProvider(cli_path="/usr/local/bin/codex")
         process = AsyncMock()
         process.communicate.return_value = (
-            b'{"type":"item.completed","item":{"type":"agent_message","text":"{\\"ok\\":true}"}}',
+            b'{"type":"item.completed","item":{"type":"agent_message","text":"{\\"ok\\":true}"}}\n'
+            b'{"type":"turn.completed"}\n',
             b"",
         )
         process.returncode = 0
@@ -2479,6 +2631,7 @@ class TestCLIProviderTimeouts:
     async def test_codex_cli_cleans_up_isolated_home_when_command_build_fails(self, tmp_path):
         provider = CodexCLIProvider(cli_path="/usr/local/bin/codex")
         cli_home = tmp_path / "codex-home"
+        cli_home.mkdir()
 
         with (
             patch.object(provider, "_create_isolated_cli_home", return_value=str(cli_home)),
@@ -2511,8 +2664,8 @@ class TestOpenRouterProviderEnvModel:
         provider = OpenRouterProvider(default_model="anthropic/claude-opus-4-5")
         assert provider._default_model == "anthropic/claude-opus-4-5"
 
-    def test_parse_response_uses_reasoning_for_structured_output_when_content_missing(self):
-        """Structured-output requests should recover JSON from reasoning-only responses."""
+    def test_parse_response_rejects_reasoning_json_when_structured_content_missing(self):
+        """Valid reasoning JSON is not a final answer, even in structured mode."""
         provider = OpenRouterProvider(api_key="sk-or-test")
         data = {
             "model": "qwen/qwen3-max-thinking",
@@ -2534,13 +2687,13 @@ class TestOpenRouterProviderEnvModel:
             ],
         }
 
-        response = provider._parse_response(data, structured_output=True)
+        response = provider._parse_response(data)
 
-        assert response.text == '{\n  "result": "READY"\n}'
-        assert response.content == '{\n  "result": "READY"\n}'
+        assert response.text is None
+        assert response.content is None
 
-    def test_parse_response_uses_reasoning_details_for_structured_output_when_content_missing(self):
-        """Structured-output requests should recover JSON from reasoning_details-only payloads."""
+    def test_parse_response_rejects_reasoning_details_when_structured_content_missing(self):
+        """Reasoning details cannot supply missing structured final content."""
         provider = OpenRouterProvider(api_key="sk-or-test")
         data = {
             "model": "qwen/qwen3-max-thinking",
@@ -2561,13 +2714,13 @@ class TestOpenRouterProviderEnvModel:
             ],
         }
 
-        response = provider._parse_response(data, structured_output=True)
+        response = provider._parse_response(data)
 
-        assert response.text == '{\n  "result": "READY"\n}'
-        assert response.content == '{\n  "result": "READY"\n}'
+        assert response.text is None
+        assert response.content is None
 
     def test_parse_response_ignores_non_json_reasoning_for_structured_output(self):
-        """Reasoning fallback should not treat plain prose as the structured payload."""
+        """Reasoning prose is not a structured final payload."""
         provider = OpenRouterProvider(api_key="sk-or-test")
         data = {
             "model": "qwen/qwen3-max-thinking",
@@ -2589,7 +2742,7 @@ class TestOpenRouterProviderEnvModel:
             ],
         }
 
-        response = provider._parse_response(data, structured_output=True)
+        response = provider._parse_response(data)
 
         assert response.text is None
         assert response.content is None
@@ -2611,7 +2764,7 @@ class TestOpenRouterProviderEnvModel:
             ],
         }
 
-        response = provider._parse_response(data, structured_output=False)
+        response = provider._parse_response(data)
 
         assert response.text is None
         assert response.content is None
@@ -2633,7 +2786,7 @@ class TestOpenRouterProviderEnvModel:
             ],
         }
 
-        response = provider._parse_response(data, structured_output=True)
+        response = provider._parse_response(data)
 
         assert response.text == '{"result":"CONTENT"}'
         assert response.content == '{"result":"CONTENT"}'
@@ -3005,19 +3158,28 @@ class TestCLIPromptOnStdin:
     LONG_PROMPT = "x" * 50_000
 
     @pytest.mark.asyncio
-    async def test_claude_code_sends_prompt_via_stdin(self):
+    async def test_claude_code_sends_prompt_via_stdin(self, claude_probe_processes):
         provider = ClaudeCodeCLIProvider(cli_path="/usr/local/bin/claude")
         process = AsyncMock()
-        process.communicate.return_value = (b'{"result":"ok"}', b"")
+        process.stdin = MagicMock(drain=AsyncMock())
+        process.communicate.return_value = (
+            b'{"type":"result","subtype":"success","is_error":false,"result":"ok"}',
+            b"",
+        )
         process.returncode = 0
 
-        with patch("asyncio.create_subprocess_exec", return_value=process) as mock_exec:
+        with patch(
+            "asyncio.create_subprocess_exec", side_effect=[*claude_probe_processes, process]
+        ) as mock_exec:
             await provider.generate(GenerateRequest(prompt=self.LONG_PROMPT))
 
         argv = list(mock_exec.await_args.args)
         assert self.LONG_PROMPT not in argv
         assert mock_exec.await_args.kwargs["stdin"] == asyncio.subprocess.PIPE
-        assert process.communicate.await_args.kwargs["input"] == self.LONG_PROMPT.encode("utf-8")
+        process.stdin.write.assert_called_once_with(self.LONG_PROMPT.encode("utf-8"))
+        process.stdin.drain.assert_awaited_once()
+        process.stdin.close.assert_called_once()
+        process.communicate.assert_awaited_once_with()
 
     @pytest.mark.asyncio
     async def test_gemini_cli_sends_prompt_via_stdin(self):
@@ -3042,7 +3204,8 @@ class TestCLIPromptOnStdin:
         provider = CodexCLIProvider(cli_path="/usr/local/bin/codex")
         process = AsyncMock()
         process.communicate.return_value = (
-            b'{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"ok"}}',
+            b'{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"ok"}}\n'
+            b'{"type":"turn.completed"}\n',
             b"",
         )
         process.returncode = 0
@@ -3065,7 +3228,8 @@ class TestCLIPromptOnStdin:
             captured["stdin"] = kwargs["stdin"].read()
             process = AsyncMock()
             process.communicate.return_value = (
-                b'{"type":"item.completed","item":{"id":"i","type":"agent_message","text":"ok"}}',
+                b'{"type":"item.completed","item":{"id":"i","type":"agent_message","text":"ok"}}\n'
+                b'{"type":"turn.completed"}\n',
                 b"",
             )
             process.returncode = 0
@@ -3086,7 +3250,8 @@ class TestCLIPromptOnStdin:
             seen["path"] = kwargs["stdin"].name
             process = AsyncMock()
             process.communicate.return_value = (
-                b'{"type":"item.completed","item":{"id":"i","type":"agent_message","text":"ok"}}',
+                b'{"type":"item.completed","item":{"id":"i","type":"agent_message","text":"ok"}}\n'
+                b'{"type":"turn.completed"}\n',
                 b"",
             )
             process.returncode = 0
@@ -3130,160 +3295,7 @@ class TestCodexTurnFailed:
             _ingest_codex_stdout_line(line, state)
 
         assert state.error_message == "model gpt-nope is not supported"
-        assert state.saw_turn_completed is True
-        # A rejected turn also raises the completion signal, so the two must be
-        # distinguishable: only this flag says "there is no answer coming".
-        assert state.saw_turn_failed is True
-
-    def test_a_healthy_turn_is_not_marked_failed(self):
-        from llm_council.providers.cli.codex import _ingest_codex_stdout_line, _LiveCodexState
-
-        state = _LiveCodexState()
-        _ingest_codex_stdout_line('{"type":"turn.completed"}', state)
-
-        assert state.saw_turn_completed is True
-        assert state.saw_turn_failed is False
-
-    @staticmethod
-    def _live_process(stdout: bytes):
-        """A process on the LIVE path: real StreamReaders, so `generate` streams it."""
-
-        class LiveCodex:
-            def __init__(self) -> None:
-                self.stdout = asyncio.StreamReader()
-                self.stderr = asyncio.StreamReader()
-                self.returncode: int | None = None
-
-            async def wait(self) -> int:
-                while self.returncode is None:
-                    await asyncio.sleep(0)
-                return self.returncode
-
-        process = LiveCodex()
-        process.stdout.feed_data(stdout)
-        return process
-
-    @pytest.mark.asyncio
-    async def test_codex_raises_on_turn_failed_on_the_live_path(self, tmp_path):
-        """The batch path above has always raised; the streaming path returned an empty success.
-
-        That is the silent seat loss: the council recorded the run as successful with a
-        zero-length draft, and nothing said the model had refused the turn.
-        """
-        provider = CodexCLIProvider(cli_path="/usr/local/bin/codex")
-        process = self._live_process(self.TURN_FAILED)
-
-        async def _fake_terminate(_proc, grace_seconds: float = 1.0) -> None:
-            process.returncode = 0  # turn.failed comes back with exit code 0
-            process.stdout.feed_eof()
-            process.stderr.feed_eof()
-
-        with (
-            patch.object(provider, "_create_isolated_cli_home", return_value=str(tmp_path / "h")),
-            patch("asyncio.create_subprocess_exec", return_value=process),
-            patch(
-                "llm_council.providers.cli.codex._terminate_live_process",
-                side_effect=_fake_terminate,
-            ),
-            pytest.raises(RuntimeError, match="gpt-nope is not supported"),
-        ):
-            await provider.generate(GenerateRequest(prompt="test", timeout_seconds=10))
-
-    @pytest.mark.parametrize(
-        ("label", "event"),
-        [
-            ("no error key", b'{"type":"turn.failed"}\n'),
-            ("empty error object", b'{"type":"turn.failed","error":{}}\n'),
-            ("empty message", b'{"type":"turn.failed","error":{"message":""}}\n'),
-            ("error is a string", b'{"type":"turn.failed","error":"rejected"}\n'),
-        ],
-    )
-    @pytest.mark.asyncio
-    async def test_a_rejection_without_a_usable_message_still_fails(self, tmp_path, label, event):
-        """`turn.failed` IS the failure; the message is only the explanation.
-
-        The first version of this fix keyed off `state.error_message`, so a rejection whose
-        payload carried no usable message left `failed` False and the empty success escaped
-        anyway - the very hole the change was written to close.
-        """
-        provider = CodexCLIProvider(cli_path="/usr/local/bin/codex")
-        process = self._live_process(b'{"type":"turn.started"}\n' + event)
-
-        async def _fake_terminate(_proc, grace_seconds: float = 1.0) -> None:
-            process.returncode = 0
-            process.stdout.feed_eof()
-            process.stderr.feed_eof()
-
-        with (
-            patch.object(provider, "_create_isolated_cli_home", return_value=str(tmp_path / "h")),
-            patch("asyncio.create_subprocess_exec", return_value=process),
-            patch(
-                "llm_council.providers.cli.codex._terminate_live_process",
-                side_effect=_fake_terminate,
-            ),
-            pytest.raises(RuntimeError) as caught,
-        ):
-            await provider.generate(GenerateRequest(prompt="test", timeout_seconds=10))
-
-        assert str(caught.value).strip(), f"{label}: the error must say something"
-
-    @pytest.mark.asyncio
-    async def test_a_transient_error_event_does_not_doom_a_turn_that_recovers(self, tmp_path):
-        """Only `turn.failed` is terminal.
-
-        A bare `error` event can precede a turn that still produces an answer, so it must
-        not be promoted to a failure by this change.
-        """
-        provider = CodexCLIProvider(cli_path="/usr/local/bin/codex")
-        process = self._live_process(
-            b'{"type":"turn.started"}\n'
-            b'{"type":"error","message":"transient hiccup"}\n'
-            b'{"type":"item.completed","item":{"type":"agent_message","text":"recovered"}}\n'
-            b'{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}\n'
-        )
-
-        async def _fake_terminate(_proc, grace_seconds: float = 1.0) -> None:
-            process.returncode = 0
-            process.stdout.feed_eof()
-            process.stderr.feed_eof()
-
-        with (
-            patch.object(provider, "_create_isolated_cli_home", return_value=str(tmp_path / "h")),
-            patch("asyncio.create_subprocess_exec", return_value=process),
-            patch(
-                "llm_council.providers.cli.codex._terminate_live_process",
-                side_effect=_fake_terminate,
-            ),
-        ):
-            response = await provider.generate(GenerateRequest(prompt="test", timeout_seconds=10))
-
-        assert response.text == "recovered"
-
-    @pytest.mark.asyncio
-    async def test_live_path_still_succeeds_without_turn_failed(self, tmp_path):
-        """Guard: the new check must not fire on a healthy streamed turn."""
-        provider = CodexCLIProvider(cli_path="/usr/local/bin/codex")
-        process = self._live_process(
-            b'{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}\n'
-            b'{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}\n'
-        )
-
-        async def _fake_terminate(_proc, grace_seconds: float = 1.0) -> None:
-            process.returncode = 0
-            process.stdout.feed_eof()
-            process.stderr.feed_eof()
-
-        with (
-            patch.object(provider, "_create_isolated_cli_home", return_value=str(tmp_path / "h")),
-            patch("asyncio.create_subprocess_exec", return_value=process),
-            patch(
-                "llm_council.providers.cli.codex._terminate_live_process",
-                side_effect=_fake_terminate,
-            ),
-        ):
-            response = await provider.generate(GenerateRequest(prompt="test", timeout_seconds=10))
-
-        assert response.text == "ok"
+        assert state.saw_turn_completed is False
 
     @pytest.mark.asyncio
     async def test_codex_raises_on_turn_failed_despite_exit_zero(self):
@@ -3407,16 +3419,22 @@ class TestCLIAdapterAuthAndIsolation:
         assert not leaked, f"secrets leaked into subprocess env: {leaked}"
 
     @pytest.mark.asyncio
-    async def test_claude_runs_from_empty_scratch_cwd(self):
+    async def test_claude_runs_from_empty_scratch_cwd(self, claude_probe_processes):
         """CLAUDE.md auto-discovery walks up from the CWD, so the subprocess
         must never run from the caller's directory (prompt-injection vector on
         the non---bare fallback path)."""
         provider = ClaudeCodeCLIProvider(cli_path="/usr/local/bin/claude")
         process = AsyncMock()
-        process.communicate.return_value = (b'{"result":"ok"}', b"")
+        process.stdin = MagicMock(drain=AsyncMock())
+        process.communicate.return_value = (
+            b'{"type":"result","subtype":"success","is_error":false,"result":"ok"}',
+            b"",
+        )
         process.returncode = 0
 
-        with patch("asyncio.create_subprocess_exec", return_value=process) as mock_exec:
+        with patch(
+            "asyncio.create_subprocess_exec", side_effect=[*claude_probe_processes, process]
+        ) as mock_exec:
             await provider.generate(GenerateRequest(prompt="test"))
 
         cwd = mock_exec.await_args.kwargs["cwd"]
