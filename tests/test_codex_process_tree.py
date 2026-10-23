@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import json
 import os
 import shutil
@@ -388,6 +389,19 @@ def _kept(real: Path) -> list[Path]:
     return sorted(real.parent.glob("auth.json.council-*"))
 
 
+def _link_only_within(volume: Path) -> Callable[..., None]:
+    """os.link as a volume boundary makes it: a link that would leave `volume` fails EXDEV."""
+    link = os.link
+
+    def _link(src: Any, dst: Any, *args: Any, **kwargs: Any) -> None:
+        if not Path(dst).resolve().is_relative_to(volume.resolve()):
+            # Windows raises this as WinError 17 (ERROR_NOT_SAME_DEVICE), errno EXDEV.
+            raise OSError(errno.EXDEV, "simulated: not the same disk drive", str(src))
+        link(src, dst, *args, **kwargs)
+
+    return _link
+
+
 class TestTheSignInIsSharedNotCopied:
     """Codex rotates the ChatGPT refresh token on every refresh; a stale copy signs you out.
 
@@ -441,6 +455,78 @@ class TestTheSignInIsSharedNotCopied:
         with pytest.raises(RuntimeError, match="Refusing to\\s+copy it"):
             self._home(provider)
         assert homes and not any(home.exists() for home in homes), "the home was left behind"
+
+    def test_a_temp_dir_on_another_volume_still_shares_the_sign_in(
+        self, real_sign_in: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """2026-10-21: TEMP moved to F: while the sign-in stayed on C:.
+
+        No hard link crosses a volume, so every call was refused (WinError 17) and the seat
+        was answered by its OpenRouter failover instead. Simulated here: the sign-in's
+        directory is one volume, TEMP is another.
+        """
+        other_volume = tmp_path / "other-volume"
+        other_volume.mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(other_volume))
+        monkeypatch.setattr(codex_module.os, "link", _link_only_within(real_sign_in.parent))
+        provider = CodexCLIProvider(cli_path="codex")
+        home = self._home(provider)
+        try:
+            isolated = home / ".codex" / "auth.json"
+            assert codex_module._file_identity(isolated) == codex_module._file_identity(
+                real_sign_in
+            )
+            _codex_saves(isolated, _auth_text("refreshed"))
+            assert real_sign_in.read_text(encoding="utf-8") == _auth_text("refreshed")
+        finally:
+            provider._release_home(str(home))
+        assert not home.exists()
+        assert not any(other_volume.iterdir()), "a home was left on the other volume"
+        assert [path.name for path in real_sign_in.parent.iterdir()] == ["auth.json"]
+
+    def test_a_real_second_volume_still_shares_the_sign_in(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The case above on two real volumes, where the machine has them.
+
+        COUNCIL_TEST_SECOND_VOLUME names a writable directory on another volume than
+        pytest's temporary one, e.g. C:\\Users\\<you>\\AppData\\Local\\Temp while TEMP is on F:.
+        """
+        second = os.environ.get("COUNCIL_TEST_SECOND_VOLUME")
+        if not second or Path(second).stat().st_dev == tmp_path.stat().st_dev:
+            pytest.skip("COUNCIL_TEST_SECOND_VOLUME must name a directory on another volume")
+        root = Path(tempfile.mkdtemp(prefix="council-test-sign-in-", dir=second))
+        try:
+            real = root / "auth.json"
+            real.write_text(_auth_text("synthetic-refresh-original"), encoding="utf-8")
+            monkeypatch.setenv("CODEX_HOME", str(root))
+            for key in ("CODEX_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL"):
+                monkeypatch.delenv(key, raising=False)
+            monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+            provider = CodexCLIProvider(cli_path="codex")
+            home = self._home(provider)
+            try:
+                assert codex_module._file_identity(
+                    home / ".codex" / "auth.json"
+                ) == codex_module._file_identity(real)
+            finally:
+                provider._release_home(str(home))
+            assert not home.exists()
+            assert [path.name for path in root.iterdir()] == ["auth.json"]
+        finally:
+            shutil.rmtree(root)
+
+    def test_a_sign_in_that_cannot_be_linked_even_beside_itself_is_not_copied(
+        self, real_sign_in: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        other_volume = tmp_path / "other-volume"
+        other_volume.mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(other_volume))
+        monkeypatch.setattr(codex_module.os, "link", _link_only_within(tmp_path / "no-volume"))
+        with pytest.raises(RuntimeError, match="Refusing to\\s+copy it"):
+            self._home(CodexCLIProvider(cli_path="codex"))
+        assert not any(other_volume.iterdir()), "a home was left on the other volume"
+        assert [path.name for path in real_sign_in.parent.iterdir()] == ["auth.json"]
 
     def test_a_filesystem_that_cannot_tell_files_apart_is_refused(
         self, real_sign_in: Path, monkeypatch: pytest.MonkeyPatch

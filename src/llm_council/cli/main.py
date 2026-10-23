@@ -328,7 +328,10 @@ def _load_fallback_providers() -> dict[str, str]:
 
     A replacement containing ``/`` is instantiated as an OpenRouter virtual
     provider, so this is how a native subscription seat falls back to the same
-    model over an API key when the CLI path dies.
+    model over an API key when the CLI path dies. Nothing checks that it IS the
+    same model (a re-pinned seat keeps its old target), so every failover is
+    reported instead: provider_errors names the seat and its replacement,
+    execution_plan.failovers records the model asked, and the run is degraded.
 
     Kept separate from ``providers[].*`` on purpose: entries there are forwarded
     to the adapter constructor as kwargs, and an unexpected key would raise a
@@ -675,6 +678,7 @@ def _result_diagnostics(result: Any) -> dict[str, Any]:
         "warnings",
         "degraded_output",
         "provider_auto_fallback",
+        "failovers",
         "pending_capabilities",
         "cleanup_incomplete",
     ):

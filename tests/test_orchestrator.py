@@ -8,7 +8,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import ClassVar
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -2934,6 +2934,134 @@ class TestProviderFailover:
             provider="claude", error="CLI failed (unknown)", phase="draft", remaining_providers=0
         )
         assert second.action == DegradationAction.ABORT
+
+    @pytest.mark.asyncio
+    async def test_a_failover_is_reported_with_who_really_answered(self):
+        """FO-08: a seat answered by its failover is a seat error, and its attempts say so.
+
+        Caught live on 2026-10-23: a "codex" review was answered by openai/gpt-6.1-sol over
+        OpenRouter after the seat itself failed. provider_errors was null, and the attempt
+        OpenRouter served claimed the seat's own model, gpt-6-astra.
+        """
+        orch = self._orchestrator({"mock": "openrouter/backup"})
+        orch._execution_plan = {}
+        dead = MagicMock()
+        dead.generate = AsyncMock(side_effect=TimeoutError("upstream request timed out"))
+        backup = CaptureProvider()
+
+        with (
+            patch("asyncio.sleep", new_callable=AsyncMock),
+            patch.object(
+                orch,
+                "_instantiate_providers",
+                return_value=({"openrouter/backup": backup}, {}),
+            ),
+        ):
+            await orch._call_provider(
+                "mock",
+                dead,
+                GenerateRequest(prompt="hello", model="seat-model"),
+                phase="draft",
+                remaining_providers=0,
+            )
+
+        errors = orch._reported_provider_errors()
+        assert errors is not None and set(errors) == {"mock"}
+        assert "upstream request timed out" in errors["mock"]
+        assert "openrouter/backup" in errors["mock"]
+        assert orch._execution_plan["failovers"] == [
+            {
+                "seat": "mock",
+                "seat_model": "seat-model",
+                "provider": "openrouter/backup",
+                "model": "openrouter/backup",
+                "phase": "draft",
+                "reason": ANY,
+            }
+        ]
+        attempts = orch._execution_plan["provider_attempts"]
+        assert {a["adapter_resolved_model"] for a in attempts if a["provider"] == "mock"} == {
+            "seat-model"
+        }
+        served = attempts[-1]
+        assert (served["provider"], served["status"]) == ("openrouter/backup", "completed")
+        assert served["requested_model"] == served["adapter_resolved_model"] == "openrouter/backup"
+
+    @staticmethod
+    def _review_orchestrator() -> Orchestrator:
+        config = OrchestratorConfig(
+            enable_graceful_degradation=True,
+            fallback_providers={"mock": "openrouter/backup"},
+            output_schema={
+                "type": "object",
+                "properties": {"ok": {"type": "boolean"}},
+                "required": ["ok"],
+            },
+        )
+        with patch("llm_council.engine.orchestrator.get_registry") as mock_reg:
+            mock_reg.return_value = MagicMock()
+            mock_reg.return_value.get_provider.return_value = MagicMock()
+            return Orchestrator(providers=["mock"], config=config)
+
+    @staticmethod
+    async def _review(orch: Orchestrator, seat: ProviderAdapter) -> CouncilResult:
+        """A whole run whose draft goes through the real call path of the seat."""
+
+        async def _drafts() -> dict[str, str]:
+            response = await orch._call_provider(
+                "mock",
+                seat,
+                GenerateRequest(prompt="x", model="seat-model"),
+                phase="draft",
+                remaining_providers=0,
+            )
+            return {"mock": response.text}
+
+        async def _synthesis(_drafts, _critique):
+            return (ValidationResult(ok=True, data={"ok": True}, raw='{"ok": true}'), 1)
+
+        with (
+            patch("asyncio.sleep", new_callable=AsyncMock),
+            patch.object(
+                orch,
+                "_instantiate_providers",
+                return_value=({"openrouter/backup": CaptureProvider()}, {}),
+            ),
+            patch.object(orch, "_run_parallel_drafts", AsyncMock(side_effect=_drafts)),
+            patch.object(orch, "_run_critique", AsyncMock(return_value="a critique")),
+            patch.object(orch, "_run_synthesis", AsyncMock(side_effect=_synthesis)),
+        ):
+            return await orch.run("Review this change", "critic")
+
+    @pytest.mark.asyncio
+    async def test_a_run_answered_by_a_failover_is_degraded_not_completed(self):
+        """FO-09: whoever answers for a dead seat, the run must not read as complete.
+
+        The 2026-10-23 run was marked degraded only because its evidence happened to be
+        compacted; otherwise it would have read completed, with provider_errors null.
+        """
+        dead = MagicMock()
+        dead.generate = AsyncMock(side_effect=TimeoutError("upstream request timed out"))
+        orch = self._review_orchestrator()
+
+        result = await self._review(orch, dead)
+
+        assert result.success is True  # the failover did answer
+        assert result.execution_status == "degraded"
+        assert result.provider_errors is not None
+        assert "openrouter/backup" in result.provider_errors["mock"]
+        assert [f["seat"] for f in result.execution_plan["failovers"]] == ["mock"]
+
+    @pytest.mark.asyncio
+    async def test_a_run_whose_seat_answered_itself_stays_completed(self):
+        """FO-10: FO-09's control -- the same run without a failover is complete."""
+        orch = self._review_orchestrator()
+
+        result = await self._review(orch, CaptureProvider())
+
+        assert result.execution_status == "completed"
+        assert result.provider_errors is None
+        assert "failovers" not in result.execution_plan
 
 
 class TestEvidenceCollectionWiring:

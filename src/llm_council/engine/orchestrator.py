@@ -368,7 +368,9 @@ class OrchestratorConfig(BaseModel):
         description=(
             "Last-resort failover map (provider -> replacement provider) handed to "
             "the DegradationPolicy. Empty means no failover, which is the historic "
-            "behaviour: a seat that exhausts its retries is simply lost."
+            "behaviour: a seat that exhausts its retries is simply lost. A failover "
+            "that happens is reported in provider_errors and execution_plan.failovers "
+            "and marks the run degraded."
         ),
     )
     cost_per_1k_input: dict[str, float] = Field(default_factory=dict)
@@ -602,6 +604,7 @@ class CouncilResult(BaseModel):
             or truncated
             or plan.get("degraded_output")
             or plan.get("provider_auto_fallback")
+            or plan.get("failovers")
             or pending_capabilities
             or plan.get("cleanup_incomplete")
             or context_warnings
@@ -645,6 +648,9 @@ class Orchestrator:
         # `_provider_init_errors` feeds `remaining` for later phases, where over-counting
         # failures can abort a run that still had a usable seat.
         self._empty_draft_errors: dict[str, str] = {}
+        # Seat -> why it failed over and to whom. Reported, and likewise kept out of the
+        # availability count: the seat's failover may still answer for it in later phases.
+        self._failover_errors: dict[str, str] = {}
         self._initialize_providers()
         self._cost_calls: dict[str, int] = {}
         self._input_tokens: dict[str, int] = {}
@@ -891,6 +897,7 @@ class Orchestrator:
         self._execution_plan = None
         self._degraded_output = None
         self._effective_providers = {}
+        self._failover_errors = {}
         self._evidence_bundle = None
         self._phase_context_override = None
         self._prepared_reference_context = None
@@ -1172,9 +1179,12 @@ class Orchestrator:
         return drafts
 
     def _reported_provider_errors(self) -> dict[str, str] | None:
-        """Every seat that did not deliver, for the caller: raised or blank alike."""
+        """Every seat that did not deliver itself, for the caller: raised, blank or failed over."""
 
-        return {**self._provider_init_errors, **self._empty_draft_errors} or None
+        errors = {**self._provider_init_errors, **self._empty_draft_errors}
+        for seat, note in self._failover_errors.items():
+            errors[seat] = f"{errors[seat]} | {note}" if seat in errors else note
+        return errors or None
 
     def _format_exception_chain(self, error: BaseException) -> str:
         """Render an exception with its direct cause chain for diagnostics.
@@ -1925,6 +1935,7 @@ class Orchestrator:
                         )
                         if swapped is not None:
                             failover_used = True
+                            seat, seat_model = provider_name, resolved_model
                             provider_name, adapter = swapped
                             # The request still carries the DEAD seat's model id
                             # (set from _model_override at build time). Left alone,
@@ -1933,6 +1944,20 @@ class Orchestrator:
                             # and the fallback 400s instead of rescuing the run.
                             failover_request = base_request.model_copy(
                                 update={"model": self._failover_model_for(provider_name)}
+                            )
+                            # So would every attempt record from here on: they name the
+                            # model the failover is asked for, not the seat's.
+                            requested_model = failover_request.model
+                            resolved = requested_model or adapter.resolve_model(requested_model)
+                            resolved_model = resolved if isinstance(resolved, str) else None
+                            self._record_failover(
+                                seat=seat,
+                                seat_model=seat_model,
+                                provider=provider_name,
+                                model=resolved_model,
+                                phase=phase_label,
+                                reason=decision.reason,
+                                error=error_detail,
                             )
                             compiled = compile_request_for_provider(provider_name, failover_request)
                             self._record_request_compilation(
@@ -2391,6 +2416,43 @@ class Orchestrator:
                 f"{failed_provider} failed over to {fallback_name} in {phase}: {reason}"
             )
         return fallback_name, adapter
+
+    def _record_failover(
+        self,
+        *,
+        seat: str,
+        seat_model: str | None,
+        provider: str,
+        model: str | None,
+        phase: str,
+        reason: str,
+        error: str,
+    ) -> None:
+        """Publish a failover, so that what it answers never passes for the seat's own work.
+
+        Callers keep keying drafts and prompts by the seat, so this is the record of who
+        was asked instead: in provider_errors, in execution_plan["failovers"] (which marks
+        the run degraded) and in the attempt records that follow. Without it a run whose
+        seat failed over read success, provider_errors null and attempts claiming the
+        seat's model (2026-10-23: a "codex" review that was GPT-6.1 Sol via OpenRouter).
+        """
+
+        if self._execution_plan is not None:
+            self._execution_plan.setdefault("failovers", []).append(
+                {
+                    "seat": seat,
+                    "seat_model": seat_model,
+                    "provider": provider,
+                    "model": model,
+                    "phase": phase,
+                    "reason": reason,
+                }
+            )
+        swap = f"{phase} to {provider} (model {model or 'unknown'})"
+        note = self._failover_errors.get(seat)
+        self._failover_errors[seat] = (
+            f"{note}; {swap}" if note else f"{error} | failed over: {swap}"
+        )
 
     def _provider_identity(self, provider_name: str) -> str:
         """Map a provider or virtual provider name to its canonical identity."""

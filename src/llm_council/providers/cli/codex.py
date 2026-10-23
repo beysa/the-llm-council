@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import hashlib
 import importlib
 import json
@@ -374,13 +375,19 @@ def _name_exists(path: Path) -> bool:
     return True
 
 
+class _SignInOnAnotherVolumeError(RuntimeError):
+    """The isolated home is on another volume than the sign-in, and no hard link crosses one."""
+
+
 def _share_sign_in(source: Path, target: Path) -> tuple[tuple[int, int], str]:
     """Hard-link `target` to the user's real sign-in, or refuse. Never a symlink or a copy."""
 
     try:
         os.link(source, target)
     except OSError as exc:
-        raise RuntimeError(
+        # Windows reports a cross-volume link as WinError 17, which Python maps to EXDEV.
+        refusal = _SignInOnAnotherVolumeError if exc.errno == errno.EXDEV else RuntimeError
+        raise refusal(
             f"Codex CLI: cannot share your sign-in with the isolated home ({exc}). Refusing to "
             "copy it: Codex rotates its refresh token, and a refresh into a copy would sign "
             "you out of Codex everywhere else."
@@ -866,7 +873,19 @@ class CodexCLIProvider(ProviderAdapter):
 
     def _create_isolated_cli_home(self, runtime: _CodexRuntime | None = None) -> str:
         runtime = runtime or self._resolve_runtime()
-        cli_home = Path(tempfile.mkdtemp(prefix="llm-council-codex-home-"))
+        try:
+            return self._new_cli_home(runtime)
+        except _SignInOnAnotherVolumeError:
+            if runtime.auth_path is None:  # only a shared sign-in is ever linked
+                raise
+            # TEMP can be on another volume than the shared sign-in (2026-10-21: TEMP on F:,
+            # ~/.codex on C:), and a hard link cannot leave its volume. The sign-in's own
+            # directory is the one place certain to be on that volume and writable, so the
+            # home is made there instead; a second refusal is final, never a copy.
+            return self._new_cli_home(runtime, runtime.auth_path.parent)
+
+    def _new_cli_home(self, runtime: _CodexRuntime, parent: Path | None = None) -> str:
+        cli_home = Path(tempfile.mkdtemp(prefix="llm-council-codex-home-", dir=parent))
         try:
             codex_dir = cli_home / ".codex"
             codex_dir.mkdir()

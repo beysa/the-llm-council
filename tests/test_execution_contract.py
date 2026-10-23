@@ -37,6 +37,7 @@ from llm_council.subagents import ReasoningBudget
         ),
         ({"execution_plan": {"degraded_output": {"source": "draft"}}}, "degraded"),
         ({"execution_plan": {"provider_auto_fallback": True}}, "degraded"),
+        ({"execution_plan": {"failovers": [{"seat": "a", "provider": "x/y"}]}}, "degraded"),
         ({"execution_plan": {"cleanup_incomplete": True}}, "degraded"),
         ({"execution_plan": {"context_preparation": {"files": [{"truncated": True}]}}}, "degraded"),
         (

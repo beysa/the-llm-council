@@ -186,7 +186,9 @@ class CouncilConfig(BaseModel):
             "auth/billing error), the degradation policy swaps in the mapped "
             "provider for that call instead of losing the seat entirely. "
             "A value containing '/' is instantiated as an OpenRouter virtual "
-            "provider, e.g. {'claude': 'anthropic/claude-opus-5'}."
+            "provider, e.g. {'claude': 'anthropic/claude-opus-5'}. Every failover is "
+            "reported: provider_errors names the seat and its replacement, "
+            "execution_plan.failovers records the model asked, and the run is degraded."
         ),
     )
 
