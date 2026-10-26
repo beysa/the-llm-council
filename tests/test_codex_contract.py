@@ -1370,6 +1370,70 @@ def test_diagnostics_retain_conservative_long_secret_redaction(key):
     )
 
 
+TELEMETRY = (
+    "2026-10-14T08:00:00Z INFO codex_otel.log_only: event.name=api_request "
+    'user.email="jane.doe@example.com" user.account_id="acct-synthetic-0001"'
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parent_level", ["info", None])
+async def test_every_codex_child_runs_at_rust_log_warn(isolated_env, monkeypatch, parent_level):
+    # From `info` up Codex prints telemetry naming the account to stderr, which error
+    # reports keep: the child gets `warn` whatever the parent has.
+    if parent_level:
+        monkeypatch.setenv("RUST_LOG", parent_level)
+    calls = stub_cli(monkeypatch)
+    provider = CodexCLIProvider(cli_path="synthetic")
+    await provider.generate(GenerateRequest(prompt="test"))
+    await provider.doctor()
+    assert any("exec" in call["args"] for call in calls)
+    assert any("login" in call["args"] for call in calls)
+    assert [call["env"]["RUST_LOG"] for call in calls] == ["warn"] * len(calls)
+    assert os.environ.get("RUST_LOG") == parent_level
+
+
+def test_diagnostics_mask_account_identity():
+    redacted = CodexCLIProvider._redact(f"{TELEMETRY}\nERROR: denied: jane.doe@example.com", {})
+    assert "jane.doe@example.com" not in redacted
+    assert "acct-synthetic-0001" not in redacted
+    assert "user.email=[REDACTED] user.account_id=[REDACTED]" in redacted
+    assert redacted.endswith("ERROR: denied: [REDACTED-email]")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "ERROR: stream disconnected before completion: rate limit reached",
+        "unsupported model in bundled catalog: gpt-6.1-sol (codex-cli 0.160.1)",
+        "npm i -g @openai/codex@0.160.1",
+        "scores = q @ k.transpose(-2, -1)",
+    ],
+)
+def test_diagnostics_without_account_identity_are_unchanged(text):
+    assert CodexCLIProvider._redact(text, {}) == text
+
+
+@pytest.mark.asyncio
+async def test_error_report_keeps_telemetry_line_without_the_account(isolated_env, monkeypatch):
+    # 2026-10-14: the stderr lines a failed call reports carried a telemetry event.
+    stub_cli(monkeypatch, code=f"import sys; print({TELEMETRY!r}, file=sys.stderr); sys.exit(1)")
+    with pytest.raises(RuntimeError) as caught:
+        await CodexCLIProvider(cli_path="synthetic").generate(GenerateRequest(prompt="test"))
+    assert "codex_otel.log_only" in str(caught.value)
+    pending, visited = [caught.value], set()
+    while pending:
+        error = pending.pop()
+        if id(error) in visited:
+            continue
+        visited.add(id(error))
+        assert "jane.doe@example.com" not in str(error)
+        assert "acct-synthetic-0001" not in str(error)
+        pending.extend(
+            linked for linked in (error.__cause__, error.__context__) if linked is not None
+        )
+
+
 @pytest.mark.asyncio
 async def test_unspecified_reasoning_is_uncontrolled_not_off(isolated_env, monkeypatch):
     calls = stub_cli(monkeypatch)

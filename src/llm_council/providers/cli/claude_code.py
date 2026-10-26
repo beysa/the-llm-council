@@ -19,6 +19,7 @@ from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any, ClassVar
 
+from llm_council.logging import redact_account_identity
 from llm_council.providers.base import (
     DoctorResult,
     GenerateRequest,
@@ -81,6 +82,14 @@ _ENV_ALLOWLIST = {
 }
 _SECRET_KEYS = {"ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"}
 _DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
+# Claude Code gives the model the signed-in account's e-mail address even under
+# --system-prompt and --safe-mode, and the seat has written it into council output
+# ("Owner (<address>)" among a planner's stakeholders). Sent with every call, first and
+# on the system prompt's first line: through the npm claude.CMD shim on Windows, cmd.exe
+# cuts an argument at its first line break. The orchestrator masks what still gets out.
+_ACCOUNT_PRIVACY_INSTRUCTION = (
+    'Refer to the account holder only as "the owner", and never write an e-mail address.'
+)
 
 
 @contextlib.contextmanager
@@ -378,8 +387,9 @@ class ClaudeCodeCLIProvider(ProviderAdapter):
             "--permission-prompts": "none",
             "--bare" if source in ("api_key", "vertex") else "--safe-mode": None,
         }
-        if system:
-            options["--system-prompt"] = system
+        options["--system-prompt"] = (
+            f"{_ACCOUNT_PRIVACY_INSTRUCTION} {system}" if system else _ACCOUNT_PRIVACY_INSTRUCTION
+        )
         if effort:
             options["--effort"] = effort
         return options
@@ -546,11 +556,12 @@ class ClaudeCodeCLIProvider(ProviderAdapter):
             if secret:
                 text = text.replace(secret, "[REDACTED]")
                 text = text.replace(json.dumps(secret)[1:-1], "[REDACTED]")
-        return re.sub(
+        text = re.sub(
             r"(?i)((?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token)[\"']?\s*[:=]\s*[\"']?(?:bearer\s+)?)[^\s\"',;}]+",
             r"\1[REDACTED]",
             text,
         )
+        return redact_account_identity(text)
 
     def _failure(
         self, reason: str, stdout: str, stderr: str, code: int | None, env: dict[str, str]

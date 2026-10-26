@@ -293,9 +293,35 @@ async def test_messages_precedence_and_native_channels(provider, fake_cli, messa
     assert proc.input == expected.encode()
     assert "PROMPT" not in cmd and "USER" not in cmd
     if messages:
-        assert cmd[cmd.index("--system-prompt") + 1] == "SYSTEM"
+        assert cmd[cmd.index("--system-prompt") + 1] == (
+            f"{claude._ACCOUNT_PRIVACY_INSTRUCTION} SYSTEM"
+        )
     assert kwargs["start_new_session"] is True
     assert not Path(kwargs["cwd"]).exists()
+
+
+@pytest.mark.parametrize("system", [None, "SYSTEM", "ROLE\n\nRULES"])
+def test_every_call_tells_the_seat_to_keep_the_owner_address_out(provider, system):
+    # Claude Code gives the seat the account's e-mail address; it once named the user by it.
+    messages = [Message(role="user", content="USER")]
+    if system:
+        messages.insert(0, Message(role="system", content=system))
+    options = provider._command_options(
+        GenerateRequest(messages=messages), auth_source="subscription"
+    )
+    value = options["--system-prompt"]
+    # First line, first: cmd.exe (the npm claude.CMD shim) cuts an argument at a line break.
+    assert value.splitlines()[0].startswith(claude._ACCOUNT_PRIVACY_INSTRUCTION)
+    assert value == " ".join(filter(None, (claude._ACCOUNT_PRIVACY_INSTRUCTION, system)))
+    assert "\n" not in claude._ACCOUNT_PRIVACY_INSTRUCTION
+    assert '"the owner"' in value and "never write an e-mail address" in value
+
+
+def test_failure_details_mask_account_identity(provider):
+    stdout = json.dumps(terminal(subtype="error", result="Owner (jane.doe@example.com) approves"))
+    error = provider._failure("terminal result failed", stdout, "", 1, {})
+    assert "jane.doe@example.com" not in str(error)
+    assert "Owner ([REDACTED-email]) approves" in str(error)
 
 
 async def test_large_unicode_and_quoted_instructions_stay_on_stdin(provider, fake_cli):
@@ -1375,7 +1401,9 @@ print(json.dumps(result))
     )
     capture = json.loads(result.text)
     assert capture["prompt"] == text
-    assert capture["argv"][capture["argv"].index("--system-prompt") + 1] == "SYSTEM"
+    assert capture["argv"][capture["argv"].index("--system-prompt") + 1] == (
+        f"{claude._ACCOUNT_PRIVACY_INSTRUCTION} SYSTEM"
+    )
     assert text not in capture["argv"]
     assert not Path(capture["cwd"]).exists()
     assert_groups_gone(processes)

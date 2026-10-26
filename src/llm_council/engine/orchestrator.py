@@ -51,6 +51,7 @@ from llm_council.engine.degradation import (
 )
 from llm_council.engine.evidence import EvidenceBundle, collect_capability_evidence
 from llm_council.engine.health import HealthReport, preflight_check
+from llm_council.logging import redact_account_identity
 from llm_council.protocol.types import (
     FILE_STATUS_INCLUDED,
     PhaseTiming,
@@ -1206,7 +1207,8 @@ class Orchestrator:
             current = current.__cause__ or (
                 None if current.__suppress_context__ else current.__context__
             )
-        return " | ".join(part for part in parts if part)
+        # Every provider error report is rendered here, whichever adapter raised it.
+        return redact_account_identity(" | ".join(part for part in parts if part))
 
     async def _run_critique(self, drafts: dict[str, str]) -> str:
         """Run an adversarial critique over the drafts."""
@@ -1853,7 +1855,12 @@ class Orchestrator:
                 )
                 ensure_text_response(response, provider=provider_name, phase=phase or "call")
                 attempt_record["status"] = "completed"
-                return response
+                # Every draft, critique and synthesis enters the run here, before it is
+                # stored or handed to the next stage: the claude seat knows the account's
+                # address, and no stage may pass it on.
+                return response.model_copy(
+                    update={"text": redact_account_identity(response.text or "")}
+                )
 
             except asyncio.CancelledError:
                 attempt_record["status"] = "cancelled"

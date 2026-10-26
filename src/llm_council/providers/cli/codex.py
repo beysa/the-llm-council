@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 from urllib.parse import urlsplit
 
+from llm_council.logging import redact_account_identity
 from llm_council.providers.base import (
     DoctorResult,
     ErrorType,
@@ -926,6 +927,10 @@ class CodexCLIProvider(ProviderAdapter):
         env = dict(runtime.env)
         env.update(HOME=cli_home, CODEX_HOME=str(Path(cli_home) / ".codex"))
         env["XDG_CONFIG_HOME"] = str(Path(cli_home) / ".config")
+        # Set, never inherited: from `info` up Codex prints its telemetry to stderr, every
+        # event naming the account (user.email, user.account_id), and error reports keep
+        # stderr lines. At `warn` real warnings and errors still come through.
+        env["RUST_LOG"] = "warn"
         return env
 
     def _request_timeout(self, request: GenerateRequest) -> float:
@@ -1314,7 +1319,8 @@ class CodexCLIProvider(ProviderAdapter):
         for value in sorted(secrets, key=len, reverse=True):
             text = text.replace(value, "[REDACTED]")
         text = re.sub(r"(?i)(bearer\s+)[^\s\"']+", r"\1[REDACTED]", text)
-        return re.sub(r"\bsk-[A-Za-z0-9_-]+", "[REDACTED]", text)
+        text = re.sub(r"\bsk-[A-Za-z0-9_-]+", "[REDACTED]", text)
+        return redact_account_identity(text)
 
     def _error_details(self, stderr_text: str) -> str:
         lines = [line.strip() for line in stderr_text.splitlines() if line.strip()]

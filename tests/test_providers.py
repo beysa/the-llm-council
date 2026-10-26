@@ -105,6 +105,7 @@ def claude_probe_processes(tmp_path, monkeypatch):
                     "--permission-mode <mode>",
                     "--permission-prompts <target>",
                     "--safe-mode",
+                    "--system-prompt <prompt>",
                 )
             )
         ).encode(),

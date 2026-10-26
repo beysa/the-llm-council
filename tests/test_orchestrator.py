@@ -3187,3 +3187,73 @@ class TestEvidenceCollectionWiring:
 
         assert bundle.pending_capabilities == ["repo-analysis"]
         assert bundle.skipped_capabilities == ["diff-review"]
+
+
+class AddressWritingProvider(CaptureProvider):
+    """Names the account holder by address in every draft and critique, as the claude seat did."""
+
+    async def generate(
+        self, request: GenerateRequest
+    ) -> GenerateResponse | AsyncIterator[GenerateResponse]:
+        self.requests.append(request)
+        if str(request.messages[0].content).startswith("You are the synthesizer"):
+            return GenerateResponse(text='{"ok": true}')
+        return GenerateResponse(text="Stakeholders: Owner (jane.doe@example.com) pays for runs.")
+
+
+class TestAccountIdentityStaysOut:
+    """No stage hands the account's address on, and no error report carries it."""
+
+    @staticmethod
+    def _orchestrator(provider: ProviderAdapter, **config: object) -> Orchestrator:
+        with patch("llm_council.engine.orchestrator.get_registry") as mock_reg:
+            mock_reg.return_value = MagicMock()
+            mock_reg.return_value.get_provider.return_value = provider
+            return Orchestrator(
+                providers=["mock"], config=OrchestratorConfig(enable_artifacts=False, **config)
+            )
+
+    @pytest.mark.asyncio
+    async def test_an_address_in_a_draft_or_critique_is_masked_before_synthesis(self):
+        provider = AddressWritingProvider()
+        orch = self._orchestrator(provider)
+        orch._task = "Assess the plan"
+        orch._subagent_name = "planner"
+        orch._prepare_run("planner")
+        orch._schema = {
+            "type": "object",
+            "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"],
+        }
+
+        _, draft = await orch._generate_draft("mock", provider)
+        critique = await orch._run_critique({"mock": draft})
+        result, _attempts = await orch._run_synthesis({"mock": draft}, critique)
+
+        critique_prompt = provider.requests[1].messages[1].content
+        synthesis_prompt = provider.requests[2].messages[1].content
+        assert result.ok
+        for text in (draft, critique, critique_prompt, synthesis_prompt):
+            assert "jane.doe@example.com" not in text
+        # Both the draft and the critique reach synthesis, each with the address masked.
+        assert synthesis_prompt.count("Owner ([REDACTED-email])") == 2
+
+    @pytest.mark.asyncio
+    async def test_a_provider_error_report_masks_account_identity(self):
+        orch = self._orchestrator(MagicMock(), enable_graceful_degradation=False)
+        seat = MagicMock()
+        seat.generate = AsyncMock(
+            side_effect=RuntimeError(
+                'CLI failed (auth): user.account_id="acct-synthetic-0001" '
+                "signed in as jane.doe@example.com"
+            )
+        )
+
+        with pytest.raises(RuntimeError):
+            await orch._call_provider("mock", seat, GenerateRequest(prompt="hello"), phase="draft")
+
+        errors = orch._reported_provider_errors()
+        assert errors is not None
+        assert errors["mock"] == (
+            "CLI failed (auth): user.account_id=[REDACTED] signed in as [REDACTED-email]"
+        )
