@@ -30,6 +30,7 @@ from llm_council.providers.base import (
 )
 from llm_council.providers.cli._compatibility import (
     native_identity,
+    npm_shim_target,
     selected_cli_path,
 )
 from llm_council.providers.cli._subprocess import terminate_process_tree
@@ -85,8 +86,8 @@ _DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 # Claude Code gives the model the signed-in account's e-mail address even under
 # --system-prompt and --safe-mode, and the seat has written it into council output
 # ("Owner (<address>)" among a planner's stakeholders). Sent with every call, first and
-# on the system prompt's first line: through the npm claude.CMD shim on Windows, cmd.exe
-# cuts an argument at its first line break. The orchestrator masks what still gets out.
+# on the system prompt's first line, which even a launcher that cuts an argument at a line
+# break (cmd.exe, see _launch_path) delivers. The orchestrator masks what still gets out.
 _ACCOUNT_PRIVACY_INSTRUCTION = (
     'Refer to the account holder only as "the owner", and never write an e-mail address.'
 )
@@ -394,13 +395,34 @@ class ClaudeCodeCLIProvider(ProviderAdapter):
             options["--effort"] = effort
         return options
 
+    def _launch_path(self) -> str:
+        """The file to spawn. On Windows never a batch file: those run under cmd.exe.
+
+        cmd.exe ends an argument at its first line break and drops every later argument:
+        the system prompt would arrive as its first line and --effort not at all. The npm
+        claude.cmd shim only runs its executable with every argument, so that executable
+        is spawned; any other batch file is refused.
+        """
+        if not self._cli_path:
+            raise RuntimeError("Claude Code CLI not found")
+        suffix = os.path.splitext(self._cli_path)[1].lower()
+        if sys.platform != "win32" or suffix not in (".bat", ".cmd"):
+            return self._cli_path
+        target = npm_shim_target(self._cli_path)
+        if target is None:
+            raise RuntimeError(
+                f"Claude Code CLI at {self._cli_path!r} is a batch file that is not an npm "
+                "shim for an existing executable: cmd.exe would end the system prompt at its "
+                "first line break and drop every later argument. Select the claude.exe it "
+                "runs (cli_path); Council will not send instructions through cmd.exe."
+            )
+        return target
+
     def _build_command(
         self, request: GenerateRequest, *, auth_source: str | None = None
     ) -> list[str]:
-        if not self._cli_path:
-            raise RuntimeError("Claude Code CLI not found")
         return [
-            self._cli_path,
+            self._launch_path(),
             *[
                 arg
                 for flag, value in self._command_options(request, auth_source=auth_source).items()
@@ -578,11 +600,12 @@ class ClaudeCodeCLIProvider(ProviderAdapter):
         deadline: float,
         options: dict[str, str | None],
         identity: dict[str, str | None] | None = None,
+        executable: str | None = None,
     ) -> str:
-        if not self._cli_path:
-            raise RuntimeError("Claude Code CLI not found")
+        # Probe the file the generation spawns, resolved once per call.
+        executable = executable or self._launch_path()
         code, stdout, stderr = await self._run_cli(
-            [self._cli_path, "--version"],
+            [executable, "--version"],
             env=env,
             cwd=cwd,
             deadline=deadline,
@@ -592,18 +615,18 @@ class ClaudeCodeCLIProvider(ProviderAdapter):
             identity["cli_version"] = version
         if code != 0 or not version:
             raise self._failure(
-                f"version probe failed at {self._cli_path!r}",
+                f"version probe failed at {executable!r}",
                 version,
                 stderr.decode("utf-8", errors="replace"),
                 code,
                 env,
             )
         code, stdout, stderr = await self._run_cli(
-            [self._cli_path, "--help"], env=env, cwd=cwd, deadline=deadline
+            [executable, "--help"], env=env, cwd=cwd, deadline=deadline
         )
         if code != 0:
             raise self._failure(
-                f"help probe failed at {self._cli_path!r} ({version})",
+                f"help probe failed at {executable!r} ({version})",
                 "",
                 stderr.decode("utf-8", errors="replace"),
                 code,
@@ -630,7 +653,7 @@ class ClaudeCodeCLIProvider(ProviderAdapter):
         missing = sorted(options.keys() - advertised.keys())
         if missing:
             raise RuntimeError(
-                f"Claude Code missing required CLI capabilities at {self._cli_path!r} "
+                f"Claude Code missing required CLI capabilities at {executable!r} "
                 f"({version}): {', '.join(missing)}. Install a Claude CLI exposing these "
                 "controls; Council will not remove isolation flags to continue."
             )
@@ -640,7 +663,7 @@ class ClaudeCodeCLIProvider(ProviderAdapter):
                 value is None and argument is not None and argument.group(1).startswith("<")
             ):
                 raise RuntimeError(
-                    f"Claude Code unsupported argument shape for {flag} at {self._cli_path!r} "
+                    f"Claude Code unsupported argument shape for {flag} at {executable!r} "
                     f"({version}); required invocation is not advertised"
                 )
         for flag in ("--output-format", "--permission-mode", "--permission-prompts", "--effort"):
@@ -651,7 +674,7 @@ class ClaudeCodeCLIProvider(ProviderAdapter):
                 value.strip().strip("\"'") for value in choices.group(1).split(",")
             ]:
                 raise RuntimeError(
-                    f"Claude Code unsupported CLI value for {flag} at {self._cli_path!r} "
+                    f"Claude Code unsupported CLI value for {flag} at {executable!r} "
                     f"({version}); required value is not advertised"
                 )
         return version
@@ -737,6 +760,8 @@ class ClaudeCodeCLIProvider(ProviderAdapter):
         environment = dict(os.environ)
         source = self._resolve_auth(environment)
         cmd = self._build_command(request, auth_source=source)
+        # cmd[0] is the file that runs: for the npm shim, the executable it names.
+        identity["cli_realpath"] = os.path.realpath(cmd[0])
         self._assert_unmanaged_environment(environment)
         with _scratch_directory() as scratch:
             cwd = str(Path(scratch) / "work")
@@ -748,6 +773,7 @@ class ClaudeCodeCLIProvider(ProviderAdapter):
                 deadline=deadline,
                 identity=identity,
                 options=self._command_options(request, auth_source=source),
+                executable=cmd[0],
             )
             self._assert_unmanaged_environment(environment)
             self._assert_unmanaged_environment(env)
