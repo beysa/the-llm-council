@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import io
 import json
 import locale
 import logging
@@ -183,6 +184,10 @@ def main(
     _cli_state["no_color"] = no_color
     _cli_state["config_path"] = config_path
     _setup_logging()
+    # A pipe's codepage can lack a character (cp1254 has no U+2264). Escape it, as stderr does,
+    # rather than lose a finished run's result to the print.
+    if isinstance(sys.stdout, io.TextIOWrapper):
+        sys.stdout.reconfigure(errors="backslashreplace")
 
 
 # Agent aliases for backwards compatibility (deprecated -> new agent, mode)
@@ -1106,16 +1111,26 @@ def run(
     """Run a council task with the specified subagent."""
     console = _get_console()
 
-    # Handle input from file or stdin
+    # Handle input from file or stdin. Always UTF-8, never the locale's codepage, and bytes that
+    # are not UTF-8 stop the run: a wrong guess reaches every phase of every seat.
     task_text = task
     if input_file:
-        if input_file == "-":
-            task_text = sys.stdin.read().strip()
-        else:
-            input_path = Path(input_file)
-            if not input_path.exists():
-                raise ValueError(f"Input file not found: {input_file}")
-            task_text = input_path.read_text().strip()
+        try:
+            if input_file == "-":
+                if isinstance(sys.stdin, io.TextIOWrapper):
+                    sys.stdin.reconfigure(encoding="utf-8-sig")
+                task_text = sys.stdin.read().strip()
+            else:
+                input_path = Path(input_file)
+                if not input_path.exists():
+                    raise ValueError(f"Input file not found: {input_file}")
+                task_text = input_path.read_text(encoding="utf-8-sig").strip()
+        except UnicodeDecodeError as exc:
+            line = exc.object[: exc.start].count(b"\n") + 1
+            raise ValueError(
+                f"Input is not UTF-8 ({input_file}, line {line}): {exc}. "
+                "Save it as UTF-8 and run again."
+            ) from exc
 
     if not task_text:
         raise ValueError("No task provided. Use positional argument or --input")
@@ -1243,7 +1258,7 @@ def run(
     if schema_file:
         if not schema_file.is_file():
             raise ValueError(f"Schema file not found: {schema_file}")
-        custom_schema = json.loads(schema_file.read_text())
+        custom_schema = json.loads(schema_file.read_text(encoding="utf-8-sig"))
 
     # Handle dry-run
     if dry_run:

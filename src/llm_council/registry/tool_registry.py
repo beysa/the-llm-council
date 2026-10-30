@@ -153,7 +153,7 @@ class ToolRegistry:
             return
 
         try:
-            data = yaml.safe_load(config_path.read_text()) or {}
+            data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
             tools_data = data.get("tools", {})
             packs_data = data.get("capability_packs", {})
 

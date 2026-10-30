@@ -55,7 +55,7 @@ def load_schema(name: str) -> dict[str, Any]:
 
     if not schema_path.exists():
         raise FileNotFoundError(f"Schema not found: {name}")
-    with open(schema_path) as f:
+    with open(schema_path, encoding="utf-8") as f:
         loaded = json.load(f)
         if not isinstance(loaded, dict):
             raise ValueError(f"Schema '{name}' must be a JSON object")

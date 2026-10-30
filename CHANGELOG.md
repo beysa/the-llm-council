@@ -26,6 +26,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Windows: `$VAR` and `%VAR%` typed in command-line arguments are no longer expanded
   before council sees them, so `council config --set k '${VAR}'` stores the reference,
   not its value. `~` and wildcards are still expanded.
+- Windows: a task given with `--input` or on stdin is read as UTF-8, not in the locale's
+  codepage. Before, non-ASCII text reached every phase garbled, and under cp1254 `Ş`, `Ğ`
+  and `”` stopped the run. A UTF-8 BOM is dropped, and bytes that are not UTF-8 now stop
+  the run before any provider call.
+- Windows: `--schema` files, subagent prompts and packaged schemas are read as UTF-8. Before,
+  the em dash in the `critic`, `drafter` and `synthesizer` draft prompts was garbled.
+- A character stdout's encoding cannot show is printed as a backslash escape. Before, a
+  piped `--format markdown` run could fail after its result was ready.
 
 ### Changed
 - Windows: council no longer expands environment variables in command-line arguments

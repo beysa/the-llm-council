@@ -153,7 +153,7 @@ def load_subagent(name: str) -> dict[str, Any]:
 
     if not config_path.exists():
         raise FileNotFoundError(f"Subagent config not found: {name}")
-    with open(config_path) as f:
+    with open(config_path, encoding="utf-8") as f:
         loaded = yaml.safe_load(f)
         if not isinstance(loaded, dict):
             raise ValueError(f"Subagent config for '{name}' must be a YAML dictionary")
