@@ -7,6 +7,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import logging
 import os
 import struct
 import subprocess
@@ -14,6 +15,7 @@ import sys
 import sysconfig
 import zipfile
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -57,9 +59,10 @@ class TestWindowsManagedPolicy:
 
     @pytest.fixture(autouse=True)
     def _no_machine_policy(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        # Point the machine-wide locations at empty test directories.
+        # Point the machine-wide locations at empty test directories, and no opt-out.
         monkeypatch.setenv("ProgramFiles", str(tmp_path / "pf"))
         monkeypatch.setenv("ProgramData", str(tmp_path / "pd"))
+        monkeypatch.delenv("COUNCIL_CLAUDE_ALLOW_REMOTE_SETTINGS", raising=False)
 
     def test_an_unmanaged_machine_is_admitted(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -96,6 +99,145 @@ class TestWindowsManagedPolicy:
         monkeypatch.setattr(winreg, "CloseKey", lambda _key: None)
         with pytest.raises(RuntimeError, match="managed-policy configuration present"):
             ClaudeCodeCLIProvider._assert_unmanaged_environment(self._environment(tmp_path))
+
+    # Claude Code (2.1.319) saves `{}` to remote-settings.json when its settings endpoint
+    # answers 204/404, i.e. no remote settings are configured, and removes it at login/logout.
+    @staticmethod
+    def _remote_settings(
+        environment: dict[str, str], content: bytes | None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Write remote-settings.json (None: a directory of that name); no registry policy."""
+        import winreg
+
+        def _missing(*_args: object) -> None:
+            raise FileNotFoundError
+
+        monkeypatch.setattr(winreg, "OpenKey", _missing)
+        target = Path(environment["USERPROFILE"]) / ".claude" / "remote-settings.json"
+        target.parent.mkdir(parents=True)
+        if content is None:
+            target.mkdir()
+        else:
+            target.write_bytes(content)
+
+    @pytest.mark.parametrize("content", [b"{}", b"{}\r\n"], ids=["as-written", "newline"])
+    def test_the_empty_remote_settings_sentinel_is_admitted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: bytes
+    ) -> None:
+        environment = self._environment(tmp_path)
+        self._remote_settings(environment, content, monkeypatch)
+        ClaudeCodeCLIProvider._assert_unmanaged_environment(environment)
+
+    @pytest.mark.parametrize(
+        "content",
+        [b'{"hooks":{"SessionStart":[]}}', b"", b"[]", b"\xef\xbb\xbf{}", b"{}" + b" " * 64, None],
+        ids=["settings", "empty-file", "not-an-object", "bom", "oversized", "directory"],
+    )
+    def test_any_other_remote_settings_still_rejects(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: bytes | None
+    ) -> None:
+        environment = self._environment(tmp_path)
+        self._remote_settings(environment, content, monkeypatch)
+        with pytest.raises(
+            RuntimeError,
+            match=r"present in remote-settings\.json \(not Claude Code's empty sentinel\)$",
+        ):
+            ClaudeCodeCLIProvider._assert_unmanaged_environment(environment)
+
+    def test_a_link_named_remote_settings_still_rejects(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        environment = self._environment(tmp_path)
+        sentinel = tmp_path / "elsewhere.json"
+        sentinel.write_bytes(b"{}")
+        link = Path(environment["USERPROFILE"]) / ".claude" / "remote-settings.json"
+        link.parent.mkdir(parents=True)
+        try:
+            link.symlink_to(sentinel)
+        except OSError:
+            pytest.skip("creating a symbolic link needs Developer Mode or the privilege")
+        with pytest.raises(RuntimeError, match="not Claude Code's empty sentinel"):
+            ClaudeCodeCLIProvider._assert_unmanaged_environment(environment)
+
+    @pytest.mark.parametrize(
+        "change,refusal",
+        [
+            ("removed", None),  # Claude Code's login reset: the file is absent, so admitted
+            ("settings", "not Claude Code's empty sentinel"),
+            (
+                "grown",
+                "not Claude Code's empty sentinel",
+            ),  # bigger than lstat said: never read past the cap
+            ("unreadable", "could not be verified"),
+        ],
+    )
+    def test_a_change_between_lstat_and_read(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        change: str,
+        refusal: str | None,
+    ) -> None:
+        environment = self._environment(tmp_path)
+        self._remote_settings(environment, b"{}", monkeypatch)
+        opened = Path.open
+
+        def change_first(path: Path, *args: Any, **kwargs: Any) -> Any:
+            if path.name == "remote-settings.json":
+                if change == "removed":
+                    path.unlink()
+                elif change == "unreadable":
+                    raise PermissionError("synthetic read denied")
+                else:
+                    with open(path, "wb") as handle:  # the builtin, not the patched Path.open
+                        handle.write(
+                            b'{"hooks":{}}' if change == "settings" else b"{}" + b" " * 1000
+                        )
+            return opened(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", change_first)
+        if refusal is None:
+            ClaudeCodeCLIProvider._assert_unmanaged_environment(environment)
+        else:
+            with pytest.raises(RuntimeError, match=refusal):
+                ClaudeCodeCLIProvider._assert_unmanaged_environment(environment)
+
+    def test_the_opt_out_admits_remote_settings_unread_and_warns_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Read from Council's own environment: the child's environment, checked as well,
+        # never carries the variable.
+        monkeypatch.setenv("COUNCIL_CLAUDE_ALLOW_REMOTE_SETTINGS", "1")
+        claude_module._warn_remote_settings_unread.cache_clear()
+        environment = self._environment(tmp_path)
+        self._remote_settings(environment, b'{"hooks":{"SessionStart":[]}}', monkeypatch)
+        with caplog.at_level(logging.WARNING, logger=claude_module.__name__):
+            for _ in range(3):  # a request checks three times
+                ClaudeCodeCLIProvider._assert_unmanaged_environment(environment)
+        warnings = [r for r in caplog.records if "remote-settings.json" in r.getMessage()]
+        assert len(warnings) == 1
+        assert "COUNCIL_CLAUDE_ALLOW_REMOTE_SETTINGS=1" in warnings[0].getMessage()
+
+    def test_the_opt_out_covers_no_other_location(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("COUNCIL_CLAUDE_ALLOW_REMOTE_SETTINGS", "1")
+        environment = self._environment(tmp_path)
+        target = Path(environment["USERPROFILE"]) / ".claude" / "managed-settings.json"
+        target.parent.mkdir(parents=True)
+        target.write_text("{}", encoding="utf-8")
+        with pytest.raises(RuntimeError, match="managed-policy configuration present$"):
+            ClaudeCodeCLIProvider._assert_unmanaged_environment(environment)
+
+    @pytest.mark.parametrize("value", ["0", "true", "yes"])
+    def test_only_the_value_1_opts_out(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        monkeypatch.setenv("COUNCIL_CLAUDE_ALLOW_REMOTE_SETTINGS", value)
+        environment = self._environment(tmp_path)
+        self._remote_settings(environment, b'{"hooks":{}}', monkeypatch)
+        with pytest.raises(RuntimeError, match="present in remote-settings"):
+            ClaudeCodeCLIProvider._assert_unmanaged_environment(environment)
 
 
 # ------------------------------------------------------------------ the npm claude.cmd shim

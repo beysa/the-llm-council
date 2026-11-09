@@ -34,6 +34,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the em dash in the `critic`, `drafter` and `synthesizer` draft prompts was garbled.
 - A character stdout's encoding cannot show is printed as a backslash escape. Before, a
   piped `--format markdown` run could fail after its result was ready.
+- Windows: the Claude seat is no longer refused when `~/.claude/remote-settings.json` holds
+  only `{}`. Claude Code writes that file itself when its settings endpoint reports that
+  no remote settings are configured (404), and deletes it at login/logout, so the seat
+  came and went with it. This is a deliberate exception to "presence refuses": the file
+  is a cache, so admitting `{}` guarantees what an absent file does, at the moment of the
+  check. Any other content, a link, a directory or an unreadable file still refuses the
+  seat, and the refusal names the file. The file is read through one handle, never past
+  64 bytes, and one that vanishes while being read counts as absent. Every other
+  managed-policy location still refuses on presence. `COUNCIL_CLAUDE_ALLOW_REMOTE_SETTINGS=1`
+  in Council's own environment admits that one file without reading it, and logs a
+  warning once per process.
 
 ### Changed
 - Windows: council no longer expands environment variables in command-line arguments

@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
 from collections.abc import AsyncIterator, Iterator
@@ -124,6 +126,47 @@ def _normalize_usage(raw_usage: Any) -> dict[str, int] | None:
         "completion_tokens": output_tokens,
         "total_tokens": input_tokens + output_tokens,
     }
+
+
+# Claude Code (2.1.319) saves `{}` to remote-settings.json when its settings endpoint
+# answers 204/404, i.e. no remote settings are configured ("Saved empty sentinel"), and
+# deletes the file at login/logout. An empty object carries no policy. The file is a cache:
+# admitting `{}` guarantees what an absent file does, at the moment of the check, and the
+# child may still fetch. Re-verify on Claude Code upgrades; a changed format refuses.
+_REMOTE_SETTINGS_SENTINEL = b"{}"
+_REMOTE_SETTINGS_SENTINEL_MAX_BYTES = 64
+# Manual opt-out, read from Council's own environment and never passed to the child:
+# "1" admits remote-settings.json without reading it. Windows only.
+_ALLOW_REMOTE_SETTINGS_ENV = "COUNCIL_CLAUDE_ALLOW_REMOTE_SETTINGS"
+
+
+def _remote_settings_admitted(path: Path, status: os.stat_result) -> bool:
+    """Whether remote-settings.json, as ``path.lstat()`` returned ``status``, may stay.
+
+    The opt-out admits it unread. Otherwise only a regular file whose bytes, surrounding
+    whitespace stripped, are exactly ``{}``, read through one handle and never past the
+    cap. A file removed meanwhile raises FileNotFoundError; other read errors raise OSError.
+    """
+    if os.environ.get(_ALLOW_REMOTE_SETTINGS_ENV) == "1":
+        _warn_remote_settings_unread()
+        return True
+    if not stat.S_ISREG(status.st_mode) or status.st_size > _REMOTE_SETTINGS_SENTINEL_MAX_BYTES:
+        return False
+    with path.open("rb") as handle:
+        data = handle.read(_REMOTE_SETTINGS_SENTINEL_MAX_BYTES + 1)
+    return len(data) <= _REMOTE_SETTINGS_SENTINEL_MAX_BYTES and (
+        data.strip() == _REMOTE_SETTINGS_SENTINEL
+    )
+
+
+@functools.cache
+def _warn_remote_settings_unread() -> None:
+    """Once per process: the opt-out admitted remote-settings.json without reading it."""
+    logger.warning(
+        "Claude isolation: remote-settings.json admitted without reading it (%s=1); "
+        "remote managed settings in it may apply to the Claude seat",
+        _ALLOW_REMOTE_SETTINGS_ENV,
+    )
 
 
 class ClaudeCodeCLIProvider(ProviderAdapter):
@@ -282,6 +325,10 @@ class ClaudeCodeCLIProvider(ProviderAdapter):
         (Program Files, the legacy ProgramData path and the Policies registry keys),
         not a read of the native implementation as the POSIX paths were. Presence
         rejects, exactly as there; an unreadable location is unverifiable and rejects.
+        One deliberate exception: remote-settings.json holding only Claude Code's empty
+        sentinel carries no policy and is admitted, as is one that vanishes while it is
+        read; COUNCIL_CLAUDE_ALLOW_REMOTE_SETTINGS=1 in Council's own environment admits
+        that one file unread.
         """
         try:
             home = Path(environment.get("HOME") or environment.get("USERPROFILE") or Path.home())
@@ -302,11 +349,19 @@ class ClaudeCodeCLIProvider(ProviderAdapter):
                 ("ProgramData", r"C:\ProgramData"),
             ):
                 paths.append(Path(os.environ.get(variable) or fallback) / "ClaudeCode")
+            remote = config / "remote-settings.json"
             for path in paths:
                 try:
-                    path.lstat()
+                    status = path.lstat()
+                    if path == remote and _remote_settings_admitted(path, status):
+                        continue
                 except FileNotFoundError:
-                    continue
+                    continue  # absent, or removed while being read (Claude Code does so at login)
+                if path == remote:
+                    raise RuntimeError(
+                        "Claude unsupported isolation: managed-policy configuration present "
+                        "in remote-settings.json (not Claude Code's empty sentinel)"
+                    )
                 raise RuntimeError(
                     "Claude unsupported isolation: managed-policy configuration present"
                 )
