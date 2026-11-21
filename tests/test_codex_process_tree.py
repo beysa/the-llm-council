@@ -331,6 +331,8 @@ class TestSpawnOptions:
             return proc
 
         provider = CodexCLIProvider(cli_path="codex")
+        # The fake has no real PID; on POSIX the real cleanup would killpg() it.
+        monkeypatch.setattr(codex_module, "terminate_process_tree", AsyncMock())
         monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
         # A substituted spawn may return an object that cannot be resumed: never suspend it.
         await provider._run_cli(["codex"], env={}, cwd=str(tmp_path), deadline=_far())

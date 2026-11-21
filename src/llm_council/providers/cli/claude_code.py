@@ -365,16 +365,17 @@ class ClaudeCodeCLIProvider(ProviderAdapter):
                 raise RuntimeError(
                     "Claude unsupported isolation: managed-policy configuration present"
                 )
-            import winreg
+            if sys.platform == "win32":  # winreg exists only there; also narrows for mypy
+                import winreg
 
-            for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
-                try:
-                    winreg.CloseKey(winreg.OpenKey(hive, r"SOFTWARE\Policies\ClaudeCode"))
-                except FileNotFoundError:
-                    continue
-                raise RuntimeError(
-                    "Claude unsupported isolation: managed-policy configuration present"
-                )
+                for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                    try:
+                        winreg.CloseKey(winreg.OpenKey(hive, r"SOFTWARE\Policies\ClaudeCode"))
+                    except FileNotFoundError:
+                        continue
+                    raise RuntimeError(
+                        "Claude unsupported isolation: managed-policy configuration present"
+                    )
         except OSError as exc:
             raise RuntimeError(
                 "Claude unsupported isolation: managed-policy state could not be verified"
