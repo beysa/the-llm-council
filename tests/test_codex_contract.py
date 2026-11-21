@@ -77,17 +77,11 @@ _NATIVE_TESTED_VERSIONS = (
     "codex-cli 0.169.0",
 )
 _NATIVE_TOOL_CONTROL_VERSIONS = ("codex-cli 0.160.1", "codex-cli 0.169.0")
-# Codex 0.169.0 harness context that Council turns off: none may reach the model.
-_HARNESS_DEVELOPER_KINDS = {
-    "host_skills.instructions",
-    "permissions.instructions",
-    "collaboration_mode.instructions",
-}
-_HARNESS_DEVELOPER_MARKERS = (
-    "<skills_instructions>",
-    "<permissions instructions>",
-    "<collaboration_mode>",
-)
+# Allowlist, not denylist: on the 0.169.0 adapter path a developer message may carry only
+# Council's system prompt (base instructions) and the caller's developer_instructions.
+# Any other kind, including one a later build invents, fails. Measured kinds Council turns
+# off: host_skills.instructions, permissions.instructions, collaboration_mode.instructions.
+_ALLOWED_DEVELOPER_KINDS = {"model.base_instructions", "generic.developer_instructions"}
 
 
 def _assert_no_harness_developer_context(request):
@@ -96,11 +90,11 @@ def _assert_no_harness_developer_context(request):
             continue
         kinds = (item.get("internal_chat_message_metadata_passthrough") or {}).get(
             "content_item_kinds"
-        ) or []
-        assert not _HARNESS_DEVELOPER_KINDS & set(kinds), item
-        for part in item.get("content") or []:
-            text = part.get("text") or ""
-            assert not any(marker in text for marker in _HARNESS_DEVELOPER_MARKERS), text[:200]
+        )
+        # Unlabelled developer content cannot be shown to be Council's own: fail closed.
+        assert isinstance(kinds, list) and kinds, item
+        assert len(kinds) == len(item.get("content") or []), item
+        assert set(kinds) <= _ALLOWED_DEVELOPER_KINDS, kinds
 
 
 def _native_request_channels(request, version):
@@ -387,6 +381,23 @@ async def test_01601_unknown_tool_controls_fail_closed(
         await CodexCLIProvider(cli_path="synthetic").generate(GenerateRequest(prompt="test"))
     assert f"{field}={value!r}" in str(caught.value)
     assert f"codex-cli {version}" in str(caught.value)
+    assert not any("exec" in call["args"] for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_unverified_tool_controls_error_lists_every_field_bounded(isolated_env, monkeypatch):
+    monkeypatch.setattr(codex_module, "_VERIFIED_VERSIONS", ("codex-cli 0.169.0",))
+    catalog = json.loads(json.dumps(CATALOG))
+    catalog["models"][0].update(
+        {"tool_mode": "unverified_mode", "experimental_supported_tools": ["t" * 500]}
+    )
+    calls = stub_cli(monkeypatch, version="0.169.0", catalog=catalog)
+    with pytest.raises(ValueError, match="unverified tool controls ") as caught:
+        await CodexCLIProvider(cli_path="synthetic").generate(GenerateRequest(prompt="test"))
+    message = str(caught.value)
+    assert "experimental_supported_tools=" in message
+    assert "tool_mode='unverified_mode'" in message
+    assert "t" * 100 not in message
     assert not any("exec" in call["args"] for call in calls)
 
 

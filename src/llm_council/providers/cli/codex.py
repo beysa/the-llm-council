@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import re
+import reprlib
 import shlex
 import shutil
 import sys
@@ -54,38 +55,50 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL = "gpt-6.1-sol"
 # Generation only: native tools are separately disabled and catalog-validated.
 DEFAULT_FLAGS = "--sandbox read-only --skip-git-repo-check"
+
+
+@dataclass(frozen=True)
+class _VersionControls:
+    """Controls for one exact Codex build, each natively verified for that build only."""
+
+    # The catalog's model-level tool fields override feature flags, so rewrite them.
+    rewrite_catalog_tools: bool = False
+    # Extra generation settings. --strict-config rejects a key the build does not know.
+    config: dict[str, Any] = field(default_factory=dict)
+
+
+# One record per natively verified build: admitting a version means writing its entry.
+_VERSION_CONTROLS: dict[str, _VersionControls] = {
+    "codex-cli 0.149.1": _VersionControls(),
+    "codex-cli 0.153.3": _VersionControls(),
+    "codex-cli 0.160.1": _VersionControls(
+        rewrite_catalog_tools=True, config={"features.goals": False}
+    ),
+    "codex-cli 0.169.0": _VersionControls(
+        rewrite_catalog_tools=True,
+        config={
+            "features.goals": False,
+            # Without these, 0.169.0 adds a developer message carrying its bundled-skill
+            # catalog, sandbox-permission and collaboration-mode text to every request.
+            "skills.include_instructions": False,
+            "include_permissions_instructions": False,
+            "include_collaboration_mode_instructions": False,
+        },
+    ),
+}
 # The compiler imports this tested baseline; runtime metadata reports the observed version.
 _VERIFIED_VERSION = "codex-cli 0.149.1"
-_VERIFIED_VERSIONS = (
-    _VERIFIED_VERSION,
-    "codex-cli 0.153.3",
-    "codex-cli 0.160.1",
-    "codex-cli 0.169.0",
-)
-# Exact versions whose catalog model-level tool controls override feature flags
-# (natively verified).
-_TOOL_CONTROL_VERSIONS = frozenset({"codex-cli 0.160.1", "codex-cli 0.169.0"})
-# Exact-version generation settings, each natively verified for that build only:
-# --strict-config rejects a key the running build does not know.
-_VERSION_GENERATION_CONFIG: dict[str, dict[str, Any]] = {
-    "codex-cli 0.160.1": {"features.goals": False},
-    "codex-cli 0.169.0": {
-        "features.goals": False,
-        # Without these, 0.169.0 adds a developer message carrying its bundled-skill
-        # catalog, sandbox-permission and collaboration-mode text to every request.
-        "skills.include_instructions": False,
-        "include_permissions_instructions": False,
-        "include_collaboration_mode_instructions": False,
-    },
-}
+_VERIFIED_VERSIONS = tuple(_VERSION_CONTROLS)
+_NO_VERSION_CONTROLS = _VersionControls()
 _CLEANUP_SECONDS = 1.0
 
 # An isolated CODEX_HOME (and --ignore-user-config) drops the user's config.toml, so a
 # request without reasoning controls would run at the model's catalog default effort
-# (`low` for gpt-6.1-sol in 0.160.1 and 0.169.0) instead of the profile's. When the request carries no
-# reasoning, ask for this effort explicitly. Set LLM_COUNCIL_CODEX_REASONING_EFFORT to
-# override, or to empty to leave the effort to Codex. The value is still checked against
-# the model's catalog levels; an unsupported implicit default is dropped, not sent.
+# (`low` for gpt-6.1-sol in 0.160.1 and 0.169.0) instead of the profile's. When the
+# request carries no reasoning, ask for this effort explicitly. Set
+# LLM_COUNCIL_CODEX_REASONING_EFFORT to override, or to empty to leave the effort to
+# Codex. The value is still checked against the model's catalog levels; an unsupported
+# implicit default is dropped, not sent.
 _REASONING_EFFORT_ENV = "LLM_COUNCIL_CODEX_REASONING_EFFORT"
 _DEFAULT_REASONING_EFFORT = "xhigh"
 
@@ -1223,22 +1236,22 @@ class CodexCLIProvider(ProviderAdapter):
         if model not in slugs:
             raise ValueError(f"Codex unsupported model in bundled catalog: {model}")
         selected = models[slugs.index(model)]
-        if version in _TOOL_CONTROL_VERSIONS:
+        controls = _VERSION_CONTROLS.get(version, _NO_VERSION_CONTROLS)
+        if controls.rewrite_catalog_tools:
             verified_shapes = {
                 "experimental_supported_tools": ([], ["send_user_message_async", "clock"]),
                 "tool_mode": (None, "direct", "code_mode_only"),
                 "multi_agent_version": (None, "disabled", "v2"),
             }
             unverified = [
-                f"{field}={selected.get(field)!r}"
-                for field, allowed in verified_shapes.items()
-                if selected.get(field) not in allowed
+                f"{name}={reprlib.repr(selected.get(name))}"
+                for name, allowed in verified_shapes.items()
+                if selected.get(name) not in allowed
             ]
             if unverified:
                 raise ValueError(
                     f"Codex unsupported model catalog tool shape for {model} ({version}): "
-                    f"{', '.join(unverified)} is not a verified tool control; select "
-                    "another model"
+                    f"unverified tool controls {', '.join(unverified)}; select another model"
                 )
             # These model-level controls override feature flags in these exact versions.
             selected["experimental_supported_tools"] = []
@@ -1472,7 +1485,7 @@ class CodexCLIProvider(ProviderAdapter):
             cmd.extend(["--ignore-user-config", "--ignore-rules", "--ephemeral", "--strict-config"])
             cmd.extend(_config_args(runtime.config))
             cmd.extend(_config_args(_GENERATION_CONFIG))
-            cmd.extend(_config_args(_VERSION_GENERATION_CONFIG.get(version, {})))
+            cmd.extend(_config_args(_VERSION_CONTROLS.get(version, _NO_VERSION_CONTROLS).config))
             cmd.extend(["-c", f"model_catalog_json={json.dumps(catalog_path)}"])
             if instructions:
                 instruction_path = root / "instructions.txt"
