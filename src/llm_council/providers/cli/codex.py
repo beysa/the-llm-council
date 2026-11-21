@@ -56,7 +56,15 @@ DEFAULT_MODEL = "gpt-6.1-sol"
 DEFAULT_FLAGS = "--sandbox read-only --skip-git-repo-check"
 # The compiler imports this tested baseline; runtime metadata reports the observed version.
 _VERIFIED_VERSION = "codex-cli 0.149.1"
-_VERIFIED_VERSIONS = (_VERIFIED_VERSION, "codex-cli 0.153.3", "codex-cli 0.160.1")
+_VERIFIED_VERSIONS = (
+    _VERIFIED_VERSION,
+    "codex-cli 0.153.3",
+    "codex-cli 0.160.1",
+    "codex-cli 0.169.0",
+)
+# Exact versions whose catalog model-level tool controls override feature flags and
+# whose `goals` feature must be disabled explicitly (both natively verified).
+_TOOL_CONTROL_VERSIONS = frozenset({"codex-cli 0.160.1", "codex-cli 0.169.0"})
 _CLEANUP_SECONDS = 1.0
 
 # An isolated CODEX_HOME (and --ignore-user-config) drops the user's config.toml, so a
@@ -1202,7 +1210,7 @@ class CodexCLIProvider(ProviderAdapter):
         if model not in slugs:
             raise ValueError(f"Codex unsupported model in bundled catalog: {model}")
         selected = models[slugs.index(model)]
-        if version == "codex-cli 0.160.1":
+        if version in _TOOL_CONTROL_VERSIONS:
             if (
                 selected.get("experimental_supported_tools")
                 not in ([], ["send_user_message_async", "clock"])
@@ -1210,7 +1218,7 @@ class CodexCLIProvider(ProviderAdapter):
                 or selected.get("multi_agent_version") not in (None, "disabled", "v2")
             ):
                 raise ValueError("Codex unsupported model catalog tool shape")
-            # These model-level controls override feature flags in exactly 0.160.1.
+            # These model-level controls override feature flags in these exact versions.
             selected["experimental_supported_tools"] = []
             if selected.get("tool_mode") is not None:
                 selected["tool_mode"] = "direct"
@@ -1442,7 +1450,7 @@ class CodexCLIProvider(ProviderAdapter):
             cmd.extend(["--ignore-user-config", "--ignore-rules", "--ephemeral", "--strict-config"])
             cmd.extend(_config_args(runtime.config))
             cmd.extend(_config_args(_GENERATION_CONFIG))
-            if version == "codex-cli 0.160.1":
+            if version in _TOOL_CONTROL_VERSIONS:
                 cmd.extend(["-c", "features.goals=false"])
             cmd.extend(["-c", f"model_catalog_json={json.dumps(catalog_path)}"])
             if instructions:

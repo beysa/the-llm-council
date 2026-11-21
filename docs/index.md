@@ -103,7 +103,7 @@ Base doctor reports `cli_compatibility: required_flags_advertised` and leaves
 authentication and generation unverified. This is syntax advertisement, not proof
 of future isolation semantics or successful generation; use deep probes and
 inspect actual results. Managed-policy checks and terminal validation remain.
-Codex still uses the exact-version allowlist (0.149.1, 0.153.3, 0.160.1).
+Codex still uses the exact-version allowlist (0.149.1, 0.153.3, 0.160.1, 0.169.0).
 Report selected path/version and missing capabilities from diagnostics. Do not
 edit package constants or remove required controls to bypass an error.
 

@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Admit exact Codex 0.169.0, with the same version-specific tool controls as 0.160.1:
+  catalog tool fields rewritten to direct/disabled/empty and `features.goals=false`.
+  Its bundled catalog lists `gpt-6.1-sol`; `gpt-5.4` is absent. On this Mac (macOS,
+  `sandbox-exec` loopback-only network, real `~/.codex` unreadable) the contained
+  native matrix passed 34/34 with `gpt-6.1-sol`. Two mutants failed it: dropping
+  0.169.0's goals control exposed goal tools to the model. 0.169.0 Responses Lite
+  sends no tool channel when the tool set is empty and repeats the base instructions
+  as two identical leading developer messages; the native channel check pins that
+  shape. The native harness decompresses zstd request bodies with the Python 3.14
+  stdlib when available instead of requiring a `zstd` binary. This is not
+  universal model or future-version support.
 - `council config --set` no longer writes expanded `${VAR}` secrets to disk, drops
   comments, or replaces an unparseable config with the single key being set. It now
   edits the value in place, checks that the result re-parses to exactly the intended

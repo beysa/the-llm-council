@@ -72,6 +72,21 @@ def _native_codex_binary(monkeypatch):
 def _native_request_channels(request):
     if "tools" in request:
         return request["tools"], request["instructions"]
+    if request["input"][0]["type"] != "additional_tools":
+        # Exact 0.169.0 Responses Lite with an empty tool set: no tool channel exists at
+        # all, and the instructions arrive as two identical leading developer messages.
+        assert not any(item.get("type") == "additional_tools" for item in request["input"])
+        first, second = request["input"][:2]
+        channel = ("type", "role", "content")
+        assert [first.get(k) for k in channel] == [second.get(k) for k in channel], second
+        for item in (first, second):
+            kinds = item["internal_chat_message_metadata_passthrough"]["content_item_kinds"]
+            assert kinds == ["model.base_instructions"], item
+        assert first["type"] == "message", first
+        assert first["role"] == "developer", first
+        assert len(first["content"]) == 1, first
+        assert first["content"][0]["type"] == "input_text", first
+        return [], first["content"][0]["text"]
     # The exact 0.160.1 Responses Lite contract moves both channels into input.
     tools, instructions = request["input"][:2]
     assert tools["type"] == "additional_tools"
@@ -82,6 +97,22 @@ def _native_request_channels(request):
     assert len(instructions["content"]) == 1, instructions
     assert instructions["content"][0]["type"] == "input_text", instructions
     return tools["tools"], instructions["content"][0]["text"]
+
+
+def _zstd_decompress(body, env):
+    """ChatGPT-route request bodies are zstd-compressed; prefer the 3.14+ stdlib codec."""
+    try:
+        from compression import zstd  # type: ignore[import-not-found]
+    except ImportError:
+        return subprocess.run(
+            ["zstd", "-d", "-c"],
+            input=body,
+            capture_output=True,
+            timeout=3,
+            check=True,
+            env=env,
+        ).stdout
+    return zstd.decompress(body)
 
 
 def _require_loopback_network_sandbox():
@@ -233,16 +264,19 @@ async def test_generation_only_catalog_preserves_identity(isolated_env, monkeypa
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("version", ["0.149.1", "0.153.3", "0.160.1"])
+@pytest.mark.parametrize("version", ["0.149.1", "0.153.3", "0.160.1", "0.169.0"])
 async def test_goal_tool_control_is_exact_version_only(isolated_env, monkeypatch, version):
     calls = stub_cli(monkeypatch, version=version)
     await CodexCLIProvider(cli_path="synthetic").generate(GenerateRequest(prompt="test"))
-    assert ("features.goals=false" in calls[-1]["args"]) is (version == "0.160.1")
+    assert ("features.goals=false" in calls[-1]["args"]) is (version in ("0.160.1", "0.169.0"))
 
 
 @pytest.mark.asyncio
-async def test_01601_catalog_removes_only_verified_tool_controls(isolated_env, monkeypatch):
-    monkeypatch.setattr(codex_module, "_VERIFIED_VERSIONS", ("codex-cli 0.160.1",))
+@pytest.mark.parametrize("version", ["0.160.1", "0.169.0"])
+async def test_01601_catalog_removes_only_verified_tool_controls(
+    isolated_env, monkeypatch, version
+):
+    monkeypatch.setattr(codex_module, "_VERIFIED_VERSIONS", (f"codex-cli {version}",))
     catalog = json.loads(json.dumps(CATALOG))
     selected = catalog["models"][0]
     selected.update(
@@ -256,7 +290,7 @@ async def test_01601_catalog_removes_only_verified_tool_controls(isolated_env, m
         }
     )
     catalog["models"].append(CATALOG["models"][0])
-    calls = stub_cli(monkeypatch, version="0.160.1", catalog=catalog)
+    calls = stub_cli(monkeypatch, version=version, catalog=catalog)
     result = await CodexCLIProvider(cli_path="synthetic").generate(
         GenerateRequest(
             prompt="test",
@@ -274,7 +308,7 @@ async def test_01601_catalog_removes_only_verified_tool_controls(isolated_env, m
         }
     )
     assert calls[-1]["catalog"] == expected
-    assert result.raw["native_identity"]["cli_version"] == "codex-cli 0.160.1"
+    assert result.raw["native_identity"]["cli_version"] == f"codex-cli {version}"
     assert result.raw["reasoning"] == {"status": "mapped", "effort": "high"}
 
 
@@ -287,11 +321,14 @@ async def test_01601_catalog_removes_only_verified_tool_controls(isolated_env, m
         ("multi_agent_version", "unverified_version"),
     ],
 )
-async def test_01601_unknown_tool_controls_fail_closed(isolated_env, monkeypatch, field, value):
-    monkeypatch.setattr(codex_module, "_VERIFIED_VERSIONS", ("codex-cli 0.160.1",))
+@pytest.mark.parametrize("version", ["0.160.1", "0.169.0"])
+async def test_01601_unknown_tool_controls_fail_closed(
+    isolated_env, monkeypatch, field, value, version
+):
+    monkeypatch.setattr(codex_module, "_VERIFIED_VERSIONS", (f"codex-cli {version}",))
     catalog = json.loads(json.dumps(CATALOG))
     catalog["models"][0][field] = value
-    calls = stub_cli(monkeypatch, version="0.160.1", catalog=catalog)
+    calls = stub_cli(monkeypatch, version=version, catalog=catalog)
     with pytest.raises(ValueError, match="catalog tool shape"):
         await CodexCLIProvider(cli_path="synthetic").generate(GenerateRequest(prompt="test"))
     assert not any("exec" in call["args"] for call in calls)
@@ -716,7 +753,7 @@ async def test_unverified_version_rejected_before_generation(isolated_env, monke
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("version", ["0.149.1", "0.153.3", "0.160.1"])
+@pytest.mark.parametrize("version", ["0.149.1", "0.153.3", "0.160.1", "0.169.0"])
 async def test_verified_release_reports_observed_codex_version(isolated_env, monkeypatch, version):
     calls = stub_cli(monkeypatch, version=version)
     result = await CodexCLIProvider(cli_path="/synthetic/codex").generate(
@@ -787,7 +824,7 @@ async def test_codex_selected_relative_symlink_is_absolute_before_changing_cwd(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("version", ["0.149.1", "0.153.3", "0.160.1"])
+@pytest.mark.parametrize("version", ["0.149.1", "0.153.3", "0.160.1", "0.169.0"])
 async def test_codex_doctor_reports_existing_verified_identity_without_extra_probe(
     isolated_env, monkeypatch, version
 ):
@@ -815,6 +852,9 @@ async def test_codex_doctor_reports_existing_verified_identity_without_extra_pro
         "0.160.0",
         "0.160.2",
         "0.160.1-beta",
+        "0.168.0",
+        "0.169.1",
+        "0.169.0-beta",
         "1.149.1",
         "0.149.2-beta",
     ],
@@ -1495,7 +1535,7 @@ def test_native_codex_serialization(tmp_path, monkeypatch, effort, through_adapt
         timeout=5,
         check=True,
     ).stdout.strip()
-    assert version in ("codex-cli 0.149.1", "codex-cli 0.153.3", "codex-cli 0.160.1"), version
+    assert version in codex_module._VERIFIED_VERSIONS, version
     captured = []
 
     class Capture(BaseHTTPRequestHandler):
@@ -1742,7 +1782,8 @@ def test_native_adapter_tools_cannot_execute_and_auth_route_is_preserved(
         check=True,
         timeout=5,
     ).stdout.strip()
-    tls_bootstrap = version == "codex-cli 0.160.1"
+    tls_bootstrap = version in codex_module._TOOL_CONTROL_VERSIONS
+    client_version = version.removeprefix("codex-cli ")
     tls, certificate = _loopback_tls_context(tmp_path) if tls_bootstrap else (None, None)
     bundled_catalog = (
         subprocess.run(
@@ -1815,7 +1856,10 @@ def test_native_adapter_tools_cannot_execute_and_auth_route_is_preserved(
 
         def do_GET(self):
             discovery.append(self.path)
-            if tls_bootstrap and self.path == "/backend-api/codex/models?client_version=0.160.1":
+            if (
+                tls_bootstrap
+                and self.path == f"/backend-api/codex/models?client_version={client_version}"
+            ):
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(bundled_catalog)))
@@ -1861,14 +1905,7 @@ def test_native_adapter_tools_cannot_execute_and_auth_route_is_preserved(
                 self.end_headers()
                 return
             if self.headers.get("Content-Encoding") == "zstd":
-                body = subprocess.run(
-                    ["zstd", "-d", "-c"],
-                    input=body,
-                    capture_output=True,
-                    timeout=3,
-                    check=True,
-                    env=env,
-                ).stdout
+                body = _zstd_decompress(body, env)
             captured.append(json.loads(body))
             routes.append(self.path)
             headers.append(self.headers.get("Authorization"))
@@ -2097,7 +2134,7 @@ def test_native_adapter_tools_cannot_execute_and_auth_route_is_preserved(
                 "/backend-api/codex/analytics-events/events",
                 "/backend-api/wham/settings/user",
                 "/backend-api/plugins/featured?platform=codex",
-                "/backend-api/codex/models?client_version=0.160.1",
+                f"/backend-api/codex/models?client_version={client_version}",
             }, discovery
             assert "/synthetic-refresh-must-not-be-used" not in discovery
             if selected_chatgpt:

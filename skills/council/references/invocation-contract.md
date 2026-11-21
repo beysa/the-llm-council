@@ -90,7 +90,7 @@ Claude uses runtime capability admission; Codex retains exact-version admission:
 
 | Provider | Admission policy |
 | --- | --- |
-| `codex` | 0.149.1, 0.153.3, 0.160.1 |
+| `codex` | 0.149.1, 0.153.3, 0.160.1, 0.169.0 |
 | `claude` | Required CLI flags advertised by the selected binary; no build allowlist |
 
 Claude reads `--version` for diagnostics and `--help` for option definitions on
@@ -106,15 +106,15 @@ future builds. Existing policy checks and strict terminal validation still apply
 Capability probes are refreshed, not cached; they are not an atomic guarantee
 against executable replacement between probe and dispatch.
 
-Fresh contained native checks cover Codex 0.149.1 and 0.160.1; 0.153.3 retains
+Fresh contained native checks cover Codex 0.149.1, 0.160.1 and 0.169.0; 0.153.3 retains
 synthetic coverage with no fresh native run. See the release notes for the
 recorded Codex and Claude checks and final verification scope. These checks do
 not prove live provider access, review quality or future auto-update compatibility.
 
 The Codex default remains `gpt-5.4`; it is absent from the tested 0.160.1 catalog.
 Use `--models` or provider configuration to explicitly select a model supported
-by the selected CLI and account. The 0.160.1 native checks used `gpt-6.1-sol`;
-they do not establish universal model support. The 0.160.1 tool settings are
+by the selected CLI and account. The 0.160.1 and 0.169.0 native checks used `gpt-6.1-sol`;
+they do not establish universal model support. The 0.160.1/0.169.0 tool settings are
 exact-version-specific and preserve authentication, selected model and reasoning
 effort. Do not silently switch models or weaken effort to bypass a catalog error.
 
