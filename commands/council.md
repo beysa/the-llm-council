@@ -74,9 +74,10 @@ Claude CLI admission checks required capabilities on every call, not exact build
 numbers. Report missing controls from doctor; never strip isolation flags to
 proceed. Help advertises syntax, not authentication or behavioral compatibility.
 Codex still uses the exact version allowlist in the invocation contract.
-Codex 0.160.1 requires an explicit supported model: the unchanged `gpt-5.4`
-default is absent from its tested catalog. Its tool settings are version-specific,
-not universal model support or permission to change authentication/model/effort.
+The Codex default is `gpt-6.1-sol`, listed in the tested 0.160.1 and 0.169.0
+catalogs; `gpt-5.4` is absent from both. Their tool and instruction settings are
+version-specific, not universal model support or permission to change
+authentication/model/effort.
 Unknown Codex versions remain unsupported. Report doctor failure diagnostics with the
 chosen executable path and version; do not edit package constants or assume
 future builds are behaviorally verified merely because help flags still exist.

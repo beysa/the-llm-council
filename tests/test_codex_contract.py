@@ -69,12 +69,49 @@ def _native_codex_binary(monkeypatch):
     return binary
 
 
-def _native_request_channels(request):
+# Independent of the module constants under test: what each native run here verified.
+_NATIVE_TESTED_VERSIONS = (
+    "codex-cli 0.149.1",
+    "codex-cli 0.153.3",
+    "codex-cli 0.160.1",
+    "codex-cli 0.169.0",
+)
+_NATIVE_TOOL_CONTROL_VERSIONS = ("codex-cli 0.160.1", "codex-cli 0.169.0")
+# Codex 0.169.0 harness context that Council turns off: none may reach the model.
+_HARNESS_DEVELOPER_KINDS = {
+    "host_skills.instructions",
+    "permissions.instructions",
+    "collaboration_mode.instructions",
+}
+_HARNESS_DEVELOPER_MARKERS = (
+    "<skills_instructions>",
+    "<permissions instructions>",
+    "<collaboration_mode>",
+)
+
+
+def _assert_no_harness_developer_context(request):
+    for item in request["input"]:
+        if item.get("role") != "developer":
+            continue
+        kinds = (item.get("internal_chat_message_metadata_passthrough") or {}).get(
+            "content_item_kinds"
+        ) or []
+        assert not _HARNESS_DEVELOPER_KINDS & set(kinds), item
+        for part in item.get("content") or []:
+            text = part.get("text") or ""
+            assert not any(marker in text for marker in _HARNESS_DEVELOPER_MARKERS), text[:200]
+
+
+def _native_request_channels(request, version):
     if "tools" in request:
         return request["tools"], request["instructions"]
-    if request["input"][0]["type"] != "additional_tools":
+    if version == "codex-cli 0.169.0" and request["input"][0]["type"] != "additional_tools":
         # Exact 0.169.0 Responses Lite with an empty tool set: no tool channel exists at
-        # all, and the instructions arrive as two identical leading developer messages.
+        # all, and Codex's Lite serializer sends the base instructions as two identical
+        # leading developer messages. Measured: removing or emptying the catalog's
+        # base_instructions keeps both copies; only use_responses_lite=false (a wire
+        # format change Council does not make) sends one.
         assert not any(item.get("type") == "additional_tools" for item in request["input"])
         first, second = request["input"][:2]
         channel = ("type", "role", "content")
@@ -272,6 +309,23 @@ async def test_goal_tool_control_is_exact_version_only(isolated_env, monkeypatch
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("version", ["0.149.1", "0.153.3", "0.160.1", "0.169.0"])
+async def test_harness_instruction_controls_are_exact_version_only(
+    isolated_env, monkeypatch, version
+):
+    # --strict-config rejects keys an older build does not know, so only 0.169.0 gets them.
+    calls = stub_cli(monkeypatch, version=version)
+    await CodexCLIProvider(cli_path="synthetic").generate(GenerateRequest(prompt="test"))
+    args = calls[-1]["args"]
+    for setting in (
+        "skills.include_instructions=false",
+        "include_permissions_instructions=false",
+        "include_collaboration_mode_instructions=false",
+    ):
+        assert (setting in args) is (version == "0.169.0"), setting
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("version", ["0.160.1", "0.169.0"])
 async def test_01601_catalog_removes_only_verified_tool_controls(
     isolated_env, monkeypatch, version
@@ -329,8 +383,10 @@ async def test_01601_unknown_tool_controls_fail_closed(
     catalog = json.loads(json.dumps(CATALOG))
     catalog["models"][0][field] = value
     calls = stub_cli(monkeypatch, version=version, catalog=catalog)
-    with pytest.raises(ValueError, match="catalog tool shape"):
+    with pytest.raises(ValueError, match="catalog tool shape") as caught:
         await CodexCLIProvider(cli_path="synthetic").generate(GenerateRequest(prompt="test"))
+    assert f"{field}={value!r}" in str(caught.value)
+    assert f"codex-cli {version}" in str(caught.value)
     assert not any("exec" in call["args"] for call in calls)
 
 
@@ -1535,7 +1591,7 @@ def test_native_codex_serialization(tmp_path, monkeypatch, effort, through_adapt
         timeout=5,
         check=True,
     ).stdout.strip()
-    assert version in codex_module._VERIFIED_VERSIONS, version
+    assert version in _NATIVE_TESTED_VERSIONS, version
     captured = []
 
     class Capture(BaseHTTPRequestHandler):
@@ -1674,10 +1730,12 @@ def test_native_codex_serialization(tmp_path, monkeypatch, effort, through_adapt
     assert captured, (stdout.decode(), stderr.decode())
     request = captured[0]
     assert request["model"] == model
-    tools, system = _native_request_channels(request)
+    tools, system = _native_request_channels(request, version)
     if through_adapter:
         assert tools == []
         assert request["tool_choice"] == "auto"
+        if version == "codex-cli 0.169.0":
+            _assert_no_harness_developer_context(request)
     assert system == 'SYSTEM_SENTINEL "priority"\nsecond line'
     messages = request["input"]
     developer_text = "\n".join(
@@ -1782,7 +1840,7 @@ def test_native_adapter_tools_cannot_execute_and_auth_route_is_preserved(
         check=True,
         timeout=5,
     ).stdout.strip()
-    tls_bootstrap = version in codex_module._TOOL_CONTROL_VERSIONS
+    tls_bootstrap = version in _NATIVE_TOOL_CONTROL_VERSIONS
     client_version = version.removeprefix("codex-cli ")
     tls, certificate = _loopback_tls_context(tmp_path) if tls_bootstrap else (None, None)
     bundled_catalog = (
@@ -2141,11 +2199,14 @@ def test_native_adapter_tools_cannot_execute_and_auth_route_is_preserved(
                 assert "/backend-api/wham/accounts/check" in discovery
         if not direct:
             assert all(
-                _native_request_channels(r) == ([], "SYNTHETIC_SYSTEM_ONLY")
+                _native_request_channels(r, version) == ([], "SYNTHETIC_SYSTEM_ONLY")
                 and r["tool_choice"] == "auto"
                 and r["model"] == model
                 for r in captured
             )
+            if version == "codex-cli 0.169.0":
+                for r in captured:
+                    _assert_no_harness_developer_context(r)
         if structured:
             output_format = captured[0]["text"]["format"]
             assert output_format["type"] == "json_schema"
@@ -2192,7 +2253,9 @@ def test_native_adapter_tools_cannot_execute_and_auth_route_is_preserved(
                 {
                     "source": source,
                     "attack": attack,
-                    "tools": _native_request_channels(captured[0])[0] if not direct else "baseline",
+                    "tools": _native_request_channels(captured[0], version)[0]
+                    if not direct
+                    else "baseline",
                     "auth_category": "missing"
                     if source == "OPENAI_API_KEY-native"
                     else "chatgpt"

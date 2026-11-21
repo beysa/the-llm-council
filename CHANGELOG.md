@@ -15,10 +15,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   native matrix passed 34/34 with `gpt-6.1-sol`. Two mutants failed it: dropping
   0.169.0's goals control exposed goal tools to the model. 0.169.0 Responses Lite
   sends no tool channel when the tool set is empty and repeats the base instructions
-  as two identical leading developer messages; the native channel check pins that
-  shape. The native harness decompresses zstd request bodies with the Python 3.14
-  stdlib when available instead of requiring a `zstd` binary. This is not
+  as two identical leading developer messages. Removing the catalog's
+  `base_instructions` keeps both copies; only turning Responses Lite off sends one,
+  and Council keeps the wire format. The native channel check pins that shape for
+  0.169.0 only. The native harness decompresses zstd request bodies with the Python
+  3.14 stdlib when available instead of requiring a `zstd` binary. This is not
   universal model or future-version support.
+- Codex 0.169.0 no longer receives its own bundled-skill catalog, sandbox-permission
+  or collaboration-mode developer instructions (about 3.5 KB on every request).
+  Council sets `skills.include_instructions`, `include_permissions_instructions` and
+  `include_collaboration_mode_instructions` to false for that exact version only,
+  because `--strict-config` rejects keys a build does not know. Native checks now
+  assert that none of that context reaches the model.
+- A 0.160.1/0.169.0 catalog model with unverified tool fields is still refused, but
+  the error now names the model, version and field (for example 0.169.0's
+  `gpt-5.6-luna` with `multi_agent_version='v1'`).
+- Docs no longer claim the Codex default is `gpt-5.4`: it is `gpt-6.1-sol`, which
+  the tested 0.160.1 and 0.169.0 catalogs list.
 - `council config --set` no longer writes expanded `${VAR}` secrets to disk, drops
   comments, or replaces an unparseable config with the single key being set. It now
   edits the value in place, checks that the result re-parses to exactly the intended

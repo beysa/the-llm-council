@@ -62,14 +62,27 @@ _VERIFIED_VERSIONS = (
     "codex-cli 0.160.1",
     "codex-cli 0.169.0",
 )
-# Exact versions whose catalog model-level tool controls override feature flags and
-# whose `goals` feature must be disabled explicitly (both natively verified).
+# Exact versions whose catalog model-level tool controls override feature flags
+# (natively verified).
 _TOOL_CONTROL_VERSIONS = frozenset({"codex-cli 0.160.1", "codex-cli 0.169.0"})
+# Exact-version generation settings, each natively verified for that build only:
+# --strict-config rejects a key the running build does not know.
+_VERSION_GENERATION_CONFIG: dict[str, dict[str, Any]] = {
+    "codex-cli 0.160.1": {"features.goals": False},
+    "codex-cli 0.169.0": {
+        "features.goals": False,
+        # Without these, 0.169.0 adds a developer message carrying its bundled-skill
+        # catalog, sandbox-permission and collaboration-mode text to every request.
+        "skills.include_instructions": False,
+        "include_permissions_instructions": False,
+        "include_collaboration_mode_instructions": False,
+    },
+}
 _CLEANUP_SECONDS = 1.0
 
 # An isolated CODEX_HOME (and --ignore-user-config) drops the user's config.toml, so a
 # request without reasoning controls would run at the model's catalog default effort
-# (`low` for gpt-6.1-sol in 0.160.1) instead of the profile's. When the request carries no
+# (`low` for gpt-6.1-sol in 0.160.1 and 0.169.0) instead of the profile's. When the request carries no
 # reasoning, ask for this effort explicitly. Set LLM_COUNCIL_CODEX_REASONING_EFFORT to
 # override, or to empty to leave the effort to Codex. The value is still checked against
 # the model's catalog levels; an unsupported implicit default is dropped, not sent.
@@ -1211,13 +1224,22 @@ class CodexCLIProvider(ProviderAdapter):
             raise ValueError(f"Codex unsupported model in bundled catalog: {model}")
         selected = models[slugs.index(model)]
         if version in _TOOL_CONTROL_VERSIONS:
-            if (
-                selected.get("experimental_supported_tools")
-                not in ([], ["send_user_message_async", "clock"])
-                or selected.get("tool_mode") not in (None, "direct", "code_mode_only")
-                or selected.get("multi_agent_version") not in (None, "disabled", "v2")
-            ):
-                raise ValueError("Codex unsupported model catalog tool shape")
+            verified_shapes = {
+                "experimental_supported_tools": ([], ["send_user_message_async", "clock"]),
+                "tool_mode": (None, "direct", "code_mode_only"),
+                "multi_agent_version": (None, "disabled", "v2"),
+            }
+            unverified = [
+                f"{field}={selected.get(field)!r}"
+                for field, allowed in verified_shapes.items()
+                if selected.get(field) not in allowed
+            ]
+            if unverified:
+                raise ValueError(
+                    f"Codex unsupported model catalog tool shape for {model} ({version}): "
+                    f"{', '.join(unverified)} is not a verified tool control; select "
+                    "another model"
+                )
             # These model-level controls override feature flags in these exact versions.
             selected["experimental_supported_tools"] = []
             if selected.get("tool_mode") is not None:
@@ -1450,8 +1472,7 @@ class CodexCLIProvider(ProviderAdapter):
             cmd.extend(["--ignore-user-config", "--ignore-rules", "--ephemeral", "--strict-config"])
             cmd.extend(_config_args(runtime.config))
             cmd.extend(_config_args(_GENERATION_CONFIG))
-            if version in _TOOL_CONTROL_VERSIONS:
-                cmd.extend(["-c", "features.goals=false"])
+            cmd.extend(_config_args(_VERSION_GENERATION_CONFIG.get(version, {})))
             cmd.extend(["-c", f"model_catalog_json={json.dumps(catalog_path)}"])
             if instructions:
                 instruction_path = root / "instructions.txt"

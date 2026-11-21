@@ -111,12 +111,18 @@ synthetic coverage with no fresh native run. See the release notes for the
 recorded Codex and Claude checks and final verification scope. These checks do
 not prove live provider access, review quality or future auto-update compatibility.
 
-The Codex default remains `gpt-5.4`; it is absent from the tested 0.160.1 catalog.
-Use `--models` or provider configuration to explicitly select a model supported
-by the selected CLI and account. The 0.160.1 and 0.169.0 native checks used `gpt-6.1-sol`;
-they do not establish universal model support. The 0.160.1/0.169.0 tool settings are
-exact-version-specific and preserve authentication, selected model and reasoning
-effort. Do not silently switch models or weaken effort to bypass a catalog error.
+The Codex default is `gpt-6.1-sol`, listed in the tested 0.160.1 and 0.169.0
+catalogs; `gpt-5.4` is absent from both. Use `--models` or provider configuration
+to explicitly select another model supported by the selected CLI and account. The
+0.160.1 and 0.169.0 native checks used `gpt-6.1-sol`; they do not establish
+universal model support. The 0.160.1/0.169.0 tool settings are exact-version-specific
+and preserve authentication, selected model and reasoning effort. On 0.169.0 Council
+also turns off Codex's bundled-skill, sandbox-permission and collaboration-mode
+developer instructions, so the request carries only Council's system prompt (which
+0.169.0's Responses Lite format sends twice) and Codex's environment context. A
+catalog model whose tool fields are outside the verified shapes, such as one with
+`multi_agent_version: v1`, is refused, not adapted. Do not silently switch models
+or weaken effort to bypass a catalog error.
 
 Unknown Codex versions remain explicitly unsupported, even if their help output lists
 the same flags. On an unsupported-version error, report the executable path and

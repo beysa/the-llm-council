@@ -80,10 +80,11 @@ Codex's allowlist is unchanged: **0.149.1, 0.153.3 and 0.160.1**. Unknown Codex
 versions still fail explicitly. Report the chosen path/version from diagnostics,
 not an assumed shell binary; do not edit package constants to bypass a check.
 See the invocation contract for native versus synthetic verification boundaries.
-The Codex default remains `gpt-5.4`, which is absent from the tested 0.160.1
-catalog. That version requires an explicit supported model through `--models`
-or provider configuration; contained native checks used `gpt-6.1-sol`. Exact
-0.160.1 tool controls preserve authentication, selected model and reasoning effort.
+The Codex default is `gpt-6.1-sol`, listed in the tested 0.160.1 and 0.169.0
+catalogs; `gpt-5.4` is absent from both. Select another model explicitly through
+`--models` or provider configuration; contained native checks used `gpt-6.1-sol`.
+Exact 0.160.1/0.169.0 tool controls preserve authentication, selected model and
+reasoning effort.
 This is not support for every model or future CLI release.
 
 This release also includes a mode-aware execution path with runtime profiles,

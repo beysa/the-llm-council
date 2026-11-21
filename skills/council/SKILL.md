@@ -185,10 +185,11 @@ Codex retains the exact list 0.149.1/0.153.3/0.160.1/0.169.0; unknown Codex buil
 unsupported. Never edit package constants to bypass its gate. Synthetic checks
 are not live-provider or universal future compatibility proof. Fresh contained
 native checks cover Codex 0.149.1, 0.160.1 and 0.169.0; 0.153.3 has synthetic coverage,
-not a fresh native run. The unchanged `gpt-5.4` default is absent from the tested
-0.160.1 catalog: explicitly select a supported model via `--models` or provider
-configuration. The 0.160.1 and 0.169.0 native checks used `gpt-6.1-sol`, not every model. Exact-version
-tool controls preserve authentication, selected model and reasoning effort.
+not a fresh native run. The Codex default is `gpt-6.1-sol`, listed in the tested
+0.160.1 and 0.169.0 catalogs; `gpt-5.4` is absent from both, so select any other
+model explicitly via `--models` or provider configuration. The 0.160.1 and 0.169.0
+native checks used `gpt-6.1-sol`, not every model. Exact-version tool controls
+preserve authentication, selected model and reasoning effort.
 
 ## When To Use It
 
